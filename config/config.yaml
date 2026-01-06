@@ -1,0 +1,35 @@
+# 天氣報告系統配置檔
+# 使用者可在此修改 GPS 位置、時區、字型等設定
+
+# GPS 位置設定（用於取得天氣資料）
+location:
+  latitude: 25.04694511723731   # 緯度（預設：泰山明志書院）
+  longitude: 121.42667399750172 # 經度
+  timezone: "Asia/Taipei"       # 時區
+
+# 字型設定（用於圖表顯示）
+font:
+  # Windows 系統預設路徑
+  path: "C:\\Windows\\Fonts\\msjh.ttc"
+  # 備用字型（當主要字型無法載入時使用）
+  fallback:
+    - "Microsoft JhengHei"
+    - "SimHei"
+
+# 使用者資訊（用於 AI 生成描述時的參考）
+user_profile:
+  # 居住環境
+  living_type: "公寓"           # 公寓 / 透天 / 其他
+  needs_drying_clothes: false   # 是否需要曬衣服
+  
+  # 通勤方式
+  commute_method: "機車"        # 機車 / 大眾運輸 / 開車 / 其他
+  commute_times:
+    morning: "09:00"            # 早上通勤時間
+    evening: "19:00"            # 晚上通勤時間
+  
+  # 可用時間
+  available_times:
+    weekday: "晚上"             # 平日可用時間：早上 / 中午 / 晚上 / 全天
+    weekend: "全天"             # 假日可用時間
+

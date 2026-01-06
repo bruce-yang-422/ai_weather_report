@@ -12,6 +12,7 @@ from matplotlib.font_manager import FontProperties
 from datetime import datetime
 import numpy as np
 import json
+import yaml
 import math
 import logging
 import re
@@ -37,6 +38,31 @@ class Config:
         if self.fallback_fonts is None:
             self.fallback_fonts = ["Microsoft JhengHei", "SimHei"]
     
+    @classmethod
+    def load_from_yaml(cls, config_path: Path) -> 'Config':
+        """從 YAML 配置檔載入設定"""
+        if not config_path.exists():
+            logger.warning(f"找不到配置檔 {config_path}，使用預設值")
+            return cls()
+        
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_data = yaml.safe_load(f)
+            
+            location = config_data.get("location", {})
+            font = config_data.get("font", {})
+            
+            return cls(
+                lat=location.get("latitude", 25.04694511723731),
+                lon=location.get("longitude", 121.42667399750172),
+                timezone=location.get("timezone", "Asia/Taipei"),
+                font_path=font.get("path", r"C:\Windows\Fonts\msjh.ttc"),
+                fallback_fonts=font.get("fallback", ["Microsoft JhengHei", "SimHei"])
+            )
+        except Exception as e:
+            logger.error(f"讀取配置檔失敗: {e}，使用預設值")
+            return cls()
+    
     @property
     def api_url(self) -> str:
         return (
@@ -53,6 +79,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 CONFIG_PATH = PROJECT_ROOT / "config" / "Weather_descriptions_API_keys.json"
+SYSTEM_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -735,8 +762,9 @@ def main():
         logger.info("天氣預報系統啟動")
         logger.info("=" * 50)
         
-        # 初始化配置
-        config = Config()
+        # 初始化配置（從 YAML 載入）
+        config = Config.load_from_yaml(SYSTEM_CONFIG_PATH)
+        logger.info(f"載入配置：位置 ({config.lat}, {config.lon}), 時區 {config.timezone}")
         setup_font(config)
         
         # 獲取天氣數據
