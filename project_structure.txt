@@ -1,0 +1,15 @@
+📁 ai_weather_report
+├── 📁 .venv
+├── 📂 config
+│   └── 📋 Weather_descriptions_API_keys.json
+├── 📂 mapping
+│   └── 📋 weather_analysis.yaml
+├── 📂 output
+│   ├── 📋 weather.log
+│   ├── 📄 weather_analysis.txt
+│   └── 🖼️ weather_report.png
+├── 📂 scripts
+│   └── 🐍 weather.py
+├── 📄 project_structure.txt
+├── 🐍 project_tree_generator.py
+└── 📋 requirements.txt

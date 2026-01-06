@@ -1,0 +1,126 @@
+# 氣象日報 YAML 範例格式
+
+date: "01-05(一)"
+title: "氣象日報"
+
+# 今日概況
+today:
+  icon: "🌤️"
+  temperature:
+    min: 12.1
+    max: 18.4
+    unit: "°C"
+  feels_like:
+    day: 18.7
+    night: 11.8
+    unit: "°C"
+  precipitation:
+    probability: 23
+    unit: "%"
+  description: "早晚騎車偏涼、有點濕潤感，能見度稍差，上下班放慢車速比較安全。"
+
+# 未來一週預報
+weekly_forecast:
+  - date: "01-06"
+    day: "週二"
+    icon: "☁️"
+    temperature:
+      min: 12.3
+      max: 15.1
+      unit: "°C"
+    feels_like:
+      day: 12.4
+      night: 9.8
+      unit: "°C"
+    precipitation:
+      probability: 5
+      unit: "%"
+    description: "陰涼乾爽，早晚騎車記得加外套"
+  
+  - date: "01-07"
+    day: "週三"
+    icon: "☁️"
+    temperature:
+      min: 11.7
+      max: 14.2
+      unit: "°C"
+    feels_like:
+      day: 10.3
+      night: 8.6
+      unit: "°C"
+    precipitation:
+      probability: 8
+      unit: "%"
+    description: "偏冷，騎車手會冰，建議戴手套"
+  
+  - date: "01-08"
+    day: "週四"
+    icon: "☁️"
+    temperature:
+      min: 12.8
+      max: 14.7
+      unit: "°C"
+    feels_like:
+      day: 11.4
+      night: 9.7
+      unit: "°C"
+    precipitation:
+      probability: 5
+      unit: "%"
+    description: "持續陰涼，保暖衣物不要收"
+  
+  - date: "01-09"
+    day: "週五"
+    icon: "☁️"
+    temperature:
+      min: 13.3
+      max: 16.8
+      unit: "°C"
+    feels_like:
+      day: 13.6
+      night: 14.1
+      unit: "°C"
+    precipitation:
+      probability: 0
+      unit: "%"
+    description: "白天體感較舒適，通勤路況穩定"
+  
+  - date: "01-10"
+    day: "週六"
+    icon: "☁️"
+    temperature:
+      min: 11.4
+      max: 18.9
+      unit: "°C"
+    feels_like:
+      day: 15.2
+      night: 12.0
+      unit: "°C"
+    precipitation:
+      probability: 1
+      unit: "%"
+    description: "溫差稍大，下午暖早晚涼，適合外出騎車走走"
+  
+  - date: "01-11"
+    day: "週日"
+    icon: "☁️"
+    temperature:
+      min: 13.8
+      max: 16.9
+      unit: "°C"
+    feels_like:
+      day: 12.5
+      night: 9.0
+      unit: "°C"
+    precipitation:
+      probability: 3
+      unit: "%"
+    description: "天氣穩定偏涼，傍晚後騎車會冷"
+
+# 貼心提醒
+tips:
+  icon: "💡"
+  content: |
+    這週幾乎都偏陰涼、降雨機率低，重點是保暖：通勤建議穿擋風外套、圍脖和手套，
+    早晚騎車避免只穿單薄帽T，臉容易被冷風吹到的可以準備口罩或面罩。
+
