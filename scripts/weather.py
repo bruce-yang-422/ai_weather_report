@@ -429,13 +429,23 @@ class AIReportGenerator:
             return None, "gpt-4o-mini"
         
         try:
+            # 調試：檢查檔案大小和原始內容
+            file_size = config_path.stat().st_size
+            logger.info(f"API 配置檔路徑: {config_path}, 檔案大小: {file_size} bytes")
+            
             with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
+                content = f.read()
+                logger.info(f"API 配置檔原始內容: {repr(content[:100])}")
+                config = json.loads(content)
+            
             api_key = config.get("openai_api_key")
             model = config.get("openai_model", "gpt-4o-mini")
+            logger.info(f"成功載入 OpenAI API 配置，Model: {model}")
             return api_key, model
         except Exception as e:
             logger.error(f"讀取配置檔失敗: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None, "gpt-4o-mini"
     
     @classmethod
