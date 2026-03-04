@@ -69,10 +69,10 @@ logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 工具：讀取 CWA API Key
+# 工具：讀取 CWA 環境設定
 # ==========================================
 
-def load_cwa_api_key(env_path: Path) -> str:
+def load_cwa_env_settings(env_path: Path) -> Dict[str, str]:
     """
     支援兩種檔案格式：
     1) .env 形式：CWA_AUTHORIZATION=CWA-XXXX...
@@ -90,17 +90,43 @@ def load_cwa_api_key(env_path: Path) -> str:
     if not lines:
         raise ValueError(f"授權碼檔案內容無有效行：{env_path}")
 
-    # 若第一行是 KEY=VALUE，就取 VALUE
-    first = lines[0]
-    if "=" in first:
-        k, v = first.split("=", 1)
-        v = v.strip().strip('"').strip("'")
-        if not v:
-            raise ValueError(f"授權碼內容無值：{env_path}")
-        return v
+    settings: Dict[str, str] = {}
+    plain_values: List[str] = []
 
-    # 否則視為純文字 key
-    return first.strip().strip('"').strip("'")
+    for line in lines:
+        if "=" in line:
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                settings[key] = value
+        else:
+            plain_values.append(line.strip().strip('"').strip("'"))
+
+    if "CWA_AUTHORIZATION" not in settings and plain_values:
+        settings["CWA_AUTHORIZATION"] = plain_values[0]
+
+    return settings
+
+
+def load_cwa_api_key(env_path: Path) -> str:
+    settings = load_cwa_env_settings(env_path)
+    api_key = settings.get("CWA_AUTHORIZATION", "").strip()
+    if not api_key:
+        raise ValueError(f"授權碼內容無值：{env_path}")
+    return api_key
+
+
+def _parse_bool_env_value(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 # ==========================================
@@ -203,14 +229,24 @@ class WindWarningSystem:
 class CWAClient:
     BASE = "https://opendata.cwa.gov.tw/api/v1/rest/datastore"
 
-    def __init__(self, api_key: str, timeout: int = 15):
+    def __init__(self, api_key: str, timeout: int = 15, skip_ssl_verify: bool = False):
         self.api_key = api_key
         self.timeout = timeout
+        self.skip_ssl_verify = skip_ssl_verify
 
     def get(self, dataset_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.BASE}/{dataset_id}"
         merged = {"Authorization": self.api_key, "format": "JSON"}
         merged.update(params)
+
+        if self.skip_ssl_verify:
+            urllib3.disable_warnings(InsecureRequestWarning)
+            resp = requests.get(url, params=merged, timeout=self.timeout, verify=False)
+            resp.raise_for_status()
+            data = resp.json()
+            if str(data.get("success")).lower() != "true":
+                raise RuntimeError(f"CWA API 回傳 success != true：{data.get('msg') or data}")
+            return data
 
         try:
             resp = requests.get(url, params=merged, timeout=self.timeout)
@@ -1030,8 +1066,16 @@ def main() -> None:
     cfg = Config.load_from_yaml(CONFIG_PATH)
     setup_font(cfg)
 
-    api_key = load_cwa_api_key(ENV_PATH)
-    client = CWAClient(api_key)
+    env_settings = load_cwa_env_settings(ENV_PATH)
+    api_key = env_settings.get("CWA_AUTHORIZATION", "").strip()
+    if not api_key:
+        raise ValueError(f"授權碼內容無值：{ENV_PATH}")
+
+    skip_ssl_verify = _parse_bool_env_value(env_settings.get("CWA_SKIP_SSL_VERIFY"), default=False)
+    if skip_ssl_verify:
+        logger.warning("已啟用 CWA_SKIP_SSL_VERIFY，將直接跳過 CWA HTTPS 憑證驗證")
+
+    client = CWAClient(api_key, skip_ssl_verify=skip_ssl_verify)
 
     # 1) 拉資料：3 天（3 小時） + 1 週（12 小時）
     logger.info("正在取得 F-D0047-069（3天/3小時）資料...")
