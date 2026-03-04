@@ -1,13 +1,16 @@
 📁 ai_weather_report
 ├── 📁 .venv
 ├── 📂 config
-│   ├── 📋 Weather_descriptions_API_keys.json
-│   └── 📋 config.yaml
-├── 📂 mapping
-│   └── 📋 weather_analysis.yaml
+│   └── 📋 config.json
 ├── 📂 output
+│   ├── 📊 ... 還有 1 個 .csv 檔案
 │   ├── 📋 weather.log
 │   ├── 📄 weather_analysis.txt
+│   ├── 📄 weather_analysis_五股區.txt
+│   ├── 📄 weather_analysis_泰山區.txt
+│   ├── 📊 weather_raw_069.csv
+│   ├── 📊 weather_raw_069_long.csv
+│   ├── 📊 weather_raw_071.csv
 │   └── 🖼️ weather_report.png
 ├── 📂 scripts
 │   └── 🐍 weather.py
@@ -16,4 +19,5 @@
 ├── 🔧 cwa_api.env
 ├── 📄 project_structure.txt
 ├── 🐍 project_tree_generator.py
-└── 📋 requirements.txt
+├── 📋 requirements.txt
+└── 💻 run_weather.ps1

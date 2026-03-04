@@ -1,0 +1,10 @@
+{
+  "location": {
+    "city": "新北市",
+    "townships": ["五股區", "泰山區"]
+  },
+  "font": {
+    "path": "C:\\Windows\\Fonts\\msjh.ttc",
+    "fallback": ["Microsoft JhengHei", "SimHei"]
+  }
+}

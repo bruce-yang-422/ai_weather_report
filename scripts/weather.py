@@ -13,7 +13,7 @@
 專案結構（建議）：
 ai_weather_report/
 ├─ scripts/weather.py
-├─ config/config.yaml
+├─ config/config.json
 ├─ cwa_api.env
 └─ output/...
 """
@@ -33,10 +33,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import requests
 import urllib3
-import yaml
+import json
 from urllib3.exceptions import InsecureRequestWarning
 
 try:
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.font_manager import FontProperties
     MATPLOTLIB_IMPORT_ERROR = None
@@ -52,7 +54,7 @@ except ImportError as exc:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 ENV_PATH = PROJECT_ROOT / "cwa_api.env"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,7 +63,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(OUTPUT_DIR / "weather.log", encoding="utf-8"),
+        logging.FileHandler(OUTPUT_DIR / "weather.log", encoding="utf-8", mode="w"),
         logging.StreamHandler(),
     ],
 )
@@ -160,17 +162,11 @@ class Config:
             return cls()
 
         try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
             loc = data.get("location", {}) if isinstance(data, dict) else {}
 
             city = loc.get("city", "新北市")
-            # 兼容：districts / townships / location_names
-            townships = (
-                loc.get("townships")
-                or loc.get("districts")
-                or loc.get("location_names")
-                or ["五股區", "泰山區"]
-            )
+            townships = loc.get("townships") or ["五股區", "泰山區"]
 
             font = data.get("font", {}) if isinstance(data, dict) else {}
             font_path = font.get("path", r"C:\Windows\Fonts\msjh.ttc")
@@ -1149,7 +1145,7 @@ def main() -> None:
     # 3) 產生輸出（每個鄉鎮一份文字報告；圖表以第一個鄉鎮為主）
     #    你若要把兩個鄉鎮都畫成圖，可擴充為多張圖或合併圖。
     if not cfg.townships:
-        raise ValueError("config.yaml 未設定任何 townships/districts")
+        raise ValueError("config.json 未設定任何 townships")
 
     primary = cfg.townships[0]
     daily = weekly_by_town.get(primary, [])
