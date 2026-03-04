@@ -1,839 +1,1154 @@
 """
 天氣預報腳本 - 機車通勤族專用 (LINE 純文字 + 未來一週數值化版)
-主要改進：
-1. 未來一週：強制要求列出具體數值 (氣溫/體感/降雨%)
-2. 保持 LINE 純文字格式 (無 Markdown)
-3. 保持機車族風力/體感邏輯
+
+資料來源：中央氣象署 CWA 開放資料
+- 未來 3 天（逐 3 小時）：F-D0047-069
+- 未來 1 週（逐 12 小時）：F-D0047-071
+
+輸出：
+- output/weather_report.png
+- output/weather_analysis.txt
+- output/weather.log
+
+專案結構（建議）：
+ai_weather_report/
+├─ scripts/weather.py
+├─ config/config.yaml
+├─ cwa_api.env
+└─ output/...
 """
 
-import requests
-import matplotlib.pyplot as plt
-from matplotlib.font_manager import FontProperties
-from datetime import datetime
-import numpy as np
-import json
-import yaml
-import math
+from __future__ import annotations
+
+import csv
 import logging
+import math
+import os
 import re
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
-from openai import OpenAI
+from datetime import datetime, timedelta, date
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import requests
+import urllib3
+import yaml
+from urllib3.exceptions import InsecureRequestWarning
+
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.font_manager import FontProperties
+    MATPLOTLIB_IMPORT_ERROR = None
+except ImportError as exc:
+    plt = None
+    FontProperties = None
+    MATPLOTLIB_IMPORT_ERROR = exc
 
 # ==========================================
-# 配置與常量
+# 路徑與日誌
+# ==========================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+OUTPUT_DIR = PROJECT_ROOT / "output"
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
+ENV_PATH = PROJECT_ROOT / "cwa_api.env"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(OUTPUT_DIR / "weather.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# 工具：讀取 CWA API Key
+# ==========================================
+
+def load_cwa_api_key(env_path: Path) -> str:
+    """
+    支援兩種檔案格式：
+    1) .env 形式：CWA_AUTHORIZATION=CWA-XXXX...
+    2) 純文字：CWA-XXXX...
+    """
+    if not env_path.exists():
+        raise FileNotFoundError(f"找不到授權碼檔案：{env_path}")
+
+    raw = env_path.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise ValueError(f"授權碼檔案為空：{env_path}")
+
+    # 去除註解行
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if not lines:
+        raise ValueError(f"授權碼檔案內容無有效行：{env_path}")
+
+    # 若第一行是 KEY=VALUE，就取 VALUE
+    first = lines[0]
+    if "=" in first:
+        k, v = first.split("=", 1)
+        v = v.strip().strip('"').strip("'")
+        if not v:
+            raise ValueError(f"授權碼內容無值：{env_path}")
+        return v
+
+    # 否則視為純文字 key
+    return first.strip().strip('"').strip("'")
+
+
+# ==========================================
+# 配置
 # ==========================================
 
 @dataclass
 class Config:
-    """配置類"""
-    lat: float = 25.04694511723731  # 泰山明志書院
-    lon: float = 121.42667399750172
-    timezone: str = "Asia/Taipei"
+    # 基本：地點
+    city: str = "新北市"
+    townships: List[str] = None  # 例如 ["五股區", "泰山區"]
+
+    # 字型（Windows 預設）
     font_path: str = r"C:\Windows\Fonts\msjh.ttc"
     fallback_fonts: List[str] = None
-    
+
+    # 資料集
+    dataset_3day: str = "F-D0047-069"
+    dataset_1week: str = "F-D0047-071"
+
     def __post_init__(self):
+        if self.townships is None:
+            self.townships = ["五股區", "泰山區"]
         if self.fallback_fonts is None:
             self.fallback_fonts = ["Microsoft JhengHei", "SimHei"]
-    
+
     @classmethod
-    def load_from_yaml(cls, config_path: Path) -> 'Config':
-        """從 YAML 配置檔載入設定"""
-        if not config_path.exists():
-            logger.warning(f"找不到配置檔 {config_path}，使用預設值")
+    def load_from_yaml(cls, path: Path) -> "Config":
+        if not path.exists():
+            logger.warning(f"找不到配置檔 {path}，使用預設值")
             return cls()
-        
+
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config_data = yaml.safe_load(f)
-            
-            location = config_data.get("location", {})
-            font = config_data.get("font", {})
-            
-            return cls(
-                lat=location.get("latitude", 25.04694511723731),
-                lon=location.get("longitude", 121.42667399750172),
-                timezone=location.get("timezone", "Asia/Taipei"),
-                font_path=font.get("path", r"C:\Windows\Fonts\msjh.ttc"),
-                fallback_fonts=font.get("fallback", ["Microsoft JhengHei", "SimHei"])
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            loc = data.get("location", {}) if isinstance(data, dict) else {}
+
+            city = loc.get("city", "新北市")
+            # 兼容：districts / townships / location_names
+            townships = (
+                loc.get("townships")
+                or loc.get("districts")
+                or loc.get("location_names")
+                or ["五股區", "泰山區"]
             )
+
+            font = data.get("font", {}) if isinstance(data, dict) else {}
+            font_path = font.get("path", r"C:\Windows\Fonts\msjh.ttc")
+            fallback = font.get("fallback", ["Microsoft JhengHei", "SimHei"])
+
+            return cls(city=city, townships=townships, font_path=font_path, fallback_fonts=fallback)
         except Exception as e:
-            logger.error(f"讀取配置檔失敗: {e}，使用預設值")
+            logger.error(f"讀取配置檔失敗：{e}，使用預設值")
             return cls()
-    
-    @property
-    def api_url(self) -> str:
-        return (
-            f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={self.lat}&longitude={self.lon}"
-            "&daily=temperature_2m_max,temperature_2m_min,weathercode,"
-            "precipitation_probability_max,windspeed_10m_max"
-            "&hourly=temperature_2m,relative_humidity_2m,windspeed_10m,shortwave_radiation"
-            f"&timezone={self.timezone}"
-        )
 
-# 初始化
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-OUTPUT_DIR = PROJECT_ROOT / "output"
-CONFIG_PATH = PROJECT_ROOT / "config" / "Weather_descriptions_API_keys.json"
-SYSTEM_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def setup_font(cfg: Config) -> None:
+    if plt is None or FontProperties is None:
+        logger.warning(f"matplotlib 不可用，跳過字型設置：{MATPLOTLIB_IMPORT_ERROR}")
+        return
 
-# 設置日誌
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(OUTPUT_DIR / 'weather.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ==========================================
-# 字型設置
-# ==========================================
-
-def setup_font(config: Config) -> None:
-    """設置matplotlib字型"""
     try:
-        font = FontProperties(fname=config.font_path)
-        plt.rcParams["font.family"] = font.get_name()
-        logger.info(f"成功載入字型: {font.get_name()}")
+        fp = FontProperties(fname=cfg.font_path)
+        plt.rcParams["font.family"] = fp.get_name()
+        logger.info(f"成功載入字型：{fp.get_name()}")
     except Exception as e:
-        logger.warning(f"無法載入指定字型，使用備用字型: {e}")
-        plt.rcParams["font.sans-serif"] = config.fallback_fonts
+        logger.warning(f"無法載入指定字型，改用備用字型：{e}")
+        plt.rcParams["font.sans-serif"] = cfg.fallback_fonts
     plt.rcParams["axes.unicode_minus"] = False
 
+
 # ==========================================
-# 風力警告系統
+# 風力警告（機車族）
 # ==========================================
 
 class WindWarningSystem:
-    """風力警告系統 - 針對機車騎士"""
-    
-    # 風力等級定義 (蒲福風級)
+    # 以 km/h 判定（與你原本邏輯一致）
     WIND_LEVELS = [
         (39, 49, "⚠️今日有6級強風，騎經高架或路口請抓緊龍頭。"),
         (50, 61, "⚠️今日7級疾風，車身會明顯晃動,請放慢車速。"),
         (62, 88, "⛔今日8-9級烈風，極度危險！務必慢行，防範路邊倒車。"),
-        (89, float('inf'), "☠️今日10級狂風，生命受威脅，強烈建議不要騎車出門。")
+        (89, float("inf"), "☠️今日10級狂風，生命受威脅，強烈建議不要騎車出門。"),
     ]
-    
+
     @classmethod
     def get_warning(cls, wind_kmh: float) -> str:
-        """獲取風力警告文字"""
-        for min_wind, max_wind, warning in cls.WIND_LEVELS:
-            if min_wind <= wind_kmh <= max_wind:
-                return warning
+        for mn, mx, msg in cls.WIND_LEVELS:
+            if mn <= wind_kmh <= mx:
+                return msg
         return ""
-    
+
     @classmethod
     def is_dangerous(cls, wind_kmh: float) -> bool:
-        """判斷風力是否達到危險等級"""
         return wind_kmh >= 39
 
-# ==========================================
-# 體感溫度計算
-# ==========================================
-
-class RealFeelCalculator:
-    """真實體感溫度計算器"""
-    
-    @staticmethod
-    def calculate_vapor_pressure(temp_c: float, rh_percent: float) -> float:
-        """計算水蒸氣壓"""
-        E = 6.112 * math.exp((17.67 * temp_c) / (temp_c + 243.5))
-        return E * (rh_percent / 100.0)
-    
-    @classmethod
-    def calculate_real_feel(
-        cls, 
-        temp_c: float, 
-        rh: float, 
-        wind_kmh: float, 
-        radiation_wm2: float
-    ) -> float:
-        """
-        計算真實體感溫度
-        考慮：溫度、濕度、風速、太陽輻射
-        """
-        wind_ms = wind_kmh / 3.6
-        e = cls.calculate_vapor_pressure(temp_c, rh)
-        
-        # 基礎體感溫度 (考慮濕度和風寒)
-        base_at = temp_c + (0.33 * e) - (0.70 * wind_ms) - 4.00
-        
-        # 太陽輻射修正
-        solar_correction = 0.0
-        if radiation_wm2 > 0:
-            solar_correction = (radiation_wm2 / 120.0) * (1.0 - (0.08 * wind_ms))
-            solar_correction = max(solar_correction, 0.0)
-        
-        return base_at + solar_correction
 
 # ==========================================
-# 天氣數據處理
+# CWA API Client
 # ==========================================
 
-class WeatherDataProcessor:
-    """天氣數據處理器"""
-    
-    WEATHER_CODE_MAP = {
-        0: "晴朗", 1: "晴時多雲", 2: "多雲", 3: "陰天",
-        45: "霧", 48: "霧",
-        51: "毛毛雨", 53: "毛毛雨", 55: "毛毛雨",
-        61: "小雨", 63: "中雨", 65: "大雨",
-        80: "陣雨", 81: "陣雨", 82: "強陣雨",
-        95: "雷雨", 96: "雷雨", 99: "雷雨"
-    }
-    
-    WEEKDAY_MAP = ["一", "二", "三", "四", "五", "六", "日"]
-    
-    @classmethod
-    def get_weather_description(cls, code: int) -> str:
-        """獲取天氣描述"""
-        return cls.WEATHER_CODE_MAP.get(code, "未知")
-    
-    @classmethod
-    def format_date(cls, date_str: str) -> str:
-        """格式化日期為 MM-DD(週X)"""
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
-        mmdd = dt.strftime("%m-%d")
-        weekday = cls.WEEKDAY_MAP[dt.weekday()]
-        return f"{mmdd}({weekday})"
-    
-    @staticmethod
-    def fetch_weather_data(api_url: str) -> Dict:
-        """獲取天氣數據"""
+class CWAClient:
+    BASE = "https://opendata.cwa.gov.tw/api/v1/rest/datastore"
+
+    def __init__(self, api_key: str, timeout: int = 15):
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def get(self, dataset_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self.BASE}/{dataset_id}"
+        merged = {"Authorization": self.api_key, "format": "JSON"}
+        merged.update(params)
+
         try:
-            response = requests.get(api_url, timeout=10)
-            response.raise_for_status()
-            logger.info("成功獲取天氣數據")
-            return response.json()
-        except requests.RequestException as e:
-            logger.error(f"獲取天氣數據失敗: {e}")
-            raise
-    
-    @staticmethod
-    def compute_daily_average(data: Dict, key: str) -> List[Optional[float]]:
-        """計算每日平均值"""
-        hours = data["hourly"]["time"]
-        values = data["hourly"][key]
-        
-        date_buckets = {}
-        for time_str, value in zip(hours, values):
-            date = time_str.split("T")[0]
-            date_buckets.setdefault(date, []).append(value)
-        
-        daily_dates = data["daily"]["time"]
-        averages = []
-        for date in daily_dates:
-            if date in date_buckets and date_buckets[date]:
-                avg = round(np.mean(date_buckets[date]), 1)
-                averages.append(avg)
-            else:
-                averages.append(None)
-        
-        return averages
-    
-    @classmethod
-    def process_real_feel_temperatures(
-        cls, 
-        data: Dict
-    ) -> Tuple[List[Optional[float]], List[Optional[float]]]:
-        """
-        處理日夜體感溫度
-        日間: 09:00-14:00
-        夜間: 19:00-23:00
-        """
-        hourly = data["hourly"]
-        times = hourly["time"]
-        temps = hourly["temperature_2m"]
-        rhs = hourly["relative_humidity_2m"]
-        winds = hourly["windspeed_10m"]
-        rads = hourly["shortwave_radiation"]
-        
-        date_buckets = {}
-        
-        for i in range(len(times)):
-            try:
-                dt = datetime.strptime(times[i], "%Y-%m-%dT%H:%M")
-                date_str = dt.strftime("%Y-%m-%d")
-                hour = dt.hour
-                
-                real_feel = RealFeelCalculator.calculate_real_feel(
-                    temps[i], rhs[i], winds[i], rads[i]
-                )
-                
-                if date_str not in date_buckets:
-                    date_buckets[date_str] = {"day": [], "night": []}
-                
-                if 9 <= hour <= 14:
-                    date_buckets[date_str]["day"].append(real_feel)
-                elif 19 <= hour <= 23:
-                    date_buckets[date_str]["night"].append(real_feel)
-            except (ValueError, IndexError) as e:
-                logger.warning(f"處理時間點數據時出錯: {e}")
-                continue
-        
-        daily_dates = data["daily"]["time"]
-        day_feels = []
-        night_feels = []
-        
-        for date in daily_dates:
-            if date in date_buckets:
-                day_vals = date_buckets[date]["day"]
-                day_feels.append(
-                    round(np.mean(day_vals), 1) if day_vals else None
-                )
-                
-                night_vals = date_buckets[date]["night"]
-                night_feels.append(
-                    round(np.mean(night_vals), 1) if night_vals else None
-                )
-            else:
-                day_feels.append(None)
-                night_feels.append(None)
-        
-        return day_feels, night_feels
+            resp = requests.get(url, params=merged, timeout=self.timeout)
+        except requests.exceptions.SSLError as exc:
+            logger.warning(f"CWA SSL 驗證失敗，改用未驗證連線重試：{exc}")
+            urllib3.disable_warnings(InsecureRequestWarning)
+            resp = requests.get(url, params=merged, timeout=self.timeout, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # 平臺常見：success: "true"/"false"
+        if str(data.get("success")).lower() != "true":
+            raise RuntimeError(f"CWA API 回傳 success != true：{data.get('msg') or data}")
+
+        return data
+
 
 # ==========================================
-# 報表生成
+# CWA 解析工具
 # ==========================================
 
-class WeatherReportGenerator:
-    """天氣報表生成器"""
-    
-    @staticmethod
-    def generate_image_report(
-        output_path: Path,
-        days: List[str],
-        tmax: List[float],
-        tmin: List[float],
-        day_feels: List[Optional[float]],
-        night_feels: List[Optional[float]],
-        conditions: List[str],
-        rain_probs: List[int],
-        humidities: List[Optional[float]]
-    ) -> None:
-        """生成圖表報表"""
-        
-        fig, (ax_table, ax_chart) = plt.subplots(
-            nrows=2, ncols=1, figsize=(12, 10),
-            gridspec_kw={'height_ratios': [0.8, 1]},
-            facecolor='white'
-        )
-        
-        # --- 表格部分 ---
-        ax_table.axis('off')
-        ax_table.set_title(
-            "未來 7 天天氣預報 (真實體感)",
-            fontsize=16, 
-            pad=20,
-            weight='bold'
-        )
-        
-        columns = (
-            "日期", "天氣", "最高溫\n(°C)", "最低溫\n(°C)",
-            "體感溫度(°C)\n日(含日曬)/夜", "降雨\n(%)", "濕度\n(%)"
-        )
-        
-        cell_text = []
-        for i in range(len(days)):
-            d_feel = f"{day_feels[i]:.1f}" if day_feels[i] is not None else "-"
-            n_feel = f"{night_feels[i]:.1f}" if night_feels[i] is not None else "-"
-            feel_str = f"{d_feel} / {n_feel}"
-            humidity_str = f"{humidities[i]:.0f}" if humidities[i] else "-"
-            
-            row_data = [
-                days[i], conditions[i], tmax[i], tmin[i],
-                feel_str, rain_probs[i], humidity_str
-            ]
-            cell_text.append(row_data)
-        
-        table = ax_table.table(
-            cellText=cell_text,
-            colLabels=columns,
-            loc='center',
-            cellLoc='center',
-            bbox=[0.05, 0.1, 0.9, 0.8]
-        )
-        
-        table.auto_set_font_size(False)
-        table.set_fontsize(11)
-        
-        # 表格樣式
-        for (row, col), cell in table.get_celld().items():
-            if row == 0:  # 標題行
-                cell.set_facecolor('#4A90E2')
-                cell.set_text_props(weight='bold', color='white')
-            elif row % 2 == 0:  # 偶數行
-                cell.set_facecolor('#f9f9f9')
-            
-            if col == 4 and row > 0:  # 體感溫度列
-                cell.set_text_props(weight='bold', color='#d62728')
-        
-        # --- 折線圖部分 ---
-        ax_chart.set_facecolor('white')
-        
-        ax_chart.plot(
-            days, tmax,
-            marker='o', label="實際最高溫",
-            color='#ff7f0e', linewidth=2.5, alpha=0.7
-        )
-        ax_chart.plot(
-            days, tmin,
-            marker='o', label="實際最低溫",
-            color='#1f77b4', linewidth=2.5, alpha=0.7
-        )
-        ax_chart.plot(
-            days, day_feels,
-            marker='^', label="白天體感 (09-14時)",
-            color='#d62728', linestyle='--', linewidth=2.5
-        )
-        ax_chart.plot(
-            days, night_feels,
-            marker='v', label="晚上體感 (19-00時)",
-            color='#9467bd', linestyle=':', linewidth=2.5
-        )
-        
-        ax_chart.set_xlabel("日期", fontsize=12)
-        ax_chart.set_ylabel("溫度 (°C)", fontsize=12)
-        ax_chart.set_title("真實體感與氣溫走勢", fontsize=14, weight='bold')
-        ax_chart.grid(True, linestyle='--', alpha=0.3)
-        ax_chart.legend(loc='best', framealpha=0.9)
-        
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=150, facecolor='white', bbox_inches='tight')
-        plt.close()
-        
-        logger.info(f"圖表已生成: {output_path}")
+def _ensure_records_locations(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    records = data.get("records") or {}
+    locations_list = records.get("Locations") or records.get("locations") or []
+    if not locations_list:
+        raise ValueError("回傳資料缺少 records.Locations")
+    return locations_list
+
+
+def _find_city_block(locations_list: List[Dict[str, Any]], city: str) -> Dict[str, Any]:
+    for blk in locations_list:
+        if blk.get("LocationsName") == city:
+            return blk
+    # 若 API 已被 LocationsName 篩過，可能只有一個
+    return locations_list[0]
+
+
+def _index_weather_elements(location_obj: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    回傳 dict：{ElementName: element_object}
+    element_object 內含 Time 列表
+    """
+    elements = location_obj.get("WeatherElement") or []
+    idx = {}
+    for e in elements:
+        name = e.get("ElementName")
+        if name:
+            idx[name] = e
+    return idx
+
+
+def _parse_dt(s: str) -> datetime:
+    """
+    支援：
+    - 2026-03-04T06:00:00+08:00
+    - 2026-03-04T06:00:00
+
+    為了避免 aware/naive 混算，統一轉成本機時區的 naive datetime。
+    """
+    if not s:
+        raise ValueError("空時間字串")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _to_mmdd_weekday(dt: date) -> str:
+    weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
+    return f"{dt.strftime('%m-%d')}({weekday_map[dt.weekday()]})"
+
 
 # ==========================================
-# AI 報告生成
+# 原始資料輸出：CSV（中文欄位）
 # ==========================================
 
-class AIReportGenerator:
-    """AI 文字報告生成器"""
-    
-    @staticmethod
-    def load_api_config(config_path: Path) -> Tuple[Optional[str], str]:
-        """載入 API 配置"""
-        if not config_path.exists():
-            logger.warning(f"找不到配置檔: {config_path}")
-            return None, "gpt-4o-mini"
-        
-        try:
-            # 調試：檢查檔案大小和原始內容
-            file_size = config_path.stat().st_size
-            logger.info(f"API 配置檔路徑: {config_path}, 檔案大小: {file_size} bytes")
-            
-            with open(config_path, "r", encoding="utf-8") as f:
-                content = f.read()
-                logger.info(f"API 配置檔原始內容: {repr(content[:100])}")
-                config = json.loads(content)
-            
-            api_key = config.get("openai_api_key")
-            model = config.get("openai_model", "gpt-4o-mini")
-            logger.info(f"成功載入 OpenAI API 配置，Model: {model}")
-            return api_key, model
-        except Exception as e:
-            logger.error(f"讀取配置檔失敗: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None, "gpt-4o-mini"
-    
-    @classmethod
-    def generate_ai_descriptions(
-        cls,
-        api_key: str,
-        model_name: str,
-        days: List[str],
-        conditions: List[str],
-        tmax: List[float],
-        tmin: List[float],
-        rain_probs: List[int],
-        day_feels: List[Optional[float]],
-        night_feels: List[Optional[float]],
-        max_winds_kmh: List[float]
-    ) -> Tuple[Optional[str], List[Optional[str]], Optional[str]]:
-        """
-        生成 AI 描述內容（今日描述、未來一週每日描述、貼心提醒）
-        返回：(今日描述, [每日描述列表], 貼心提醒)
-        """
-        
-        # 整理數據
-        weather_summary = "未來七天數據：\n"
-        for i in range(len(days)):
-            wind_warning = WindWarningSystem.get_warning(max_winds_kmh[i])
-            wind_str = f" [注意: {wind_warning}]" if wind_warning else ""
-            
-            day_feel_str = f"{day_feels[i]:.1f}" if day_feels[i] is not None else "N/A"
-            night_feel_str = f"{night_feels[i]:.1f}" if night_feels[i] is not None else "N/A"
-            
-            weather_summary += (
-                f"- {days[i]}: {conditions[i]}, "
-                f"氣溫 {tmin[i]}~{tmax[i]}°C, "
-                f"體感(日/夜) {day_feel_str}/{night_feel_str}°C, "
-                f"降雨 {rain_probs[i]}%{wind_str}\n"
+CSV_FIELDNAMES = [
+    "資料集代碼",
+    "資料集說明",
+    "縣市",
+    "鄉鎮市區",
+    "天氣要素",
+    "開始時間",
+    "結束時間",
+    "資料時間",
+    "值序號",
+    "值欄位",
+    "值內容",
+    "測量單位",
+]
+
+VALUE_FIELD_LABEL_MAP = {
+    "Temperature": "溫度",
+    "MaxTemperature": "最高溫度",
+    "MinTemperature": "最低溫度",
+    "ApparentTemperature": "體感溫度",
+    "MaxApparentTemperature": "最高體感溫度",
+    "MinApparentTemperature": "最低體感溫度",
+    "ProbabilityOfPrecipitation": "降雨機率",
+    "RelativeHumidity": "相對濕度",
+    "Weather": "天氣現象",
+    "WeatherDescription": "天氣預報綜合描述",
+    "WindSpeed": "風速",
+    "BeaufortScale": "蒲福風級",
+    "ComfortIndex": "舒適度指數",
+    "ComfortIndexDescription": "舒適度描述",
+    "DewPoint": "露點溫度",
+    "WeatherCode": "天氣代碼",
+    "WindDirection": "風向",
+    "MaxComfortIndex": "最高舒適度指數",
+    "MaxComfortIndexDescription": "最高舒適度描述",
+    "MinComfortIndex": "最低舒適度指數",
+    "MinComfortIndexDescription": "最低舒適度描述",
+}
+
+WIDE_BASE_FIELDNAMES = [
+    "資料集代碼",
+    "資料集說明",
+    "縣市",
+    "鄉鎮市區",
+    "開始時間",
+    "結束時間",
+    "資料時間",
+]
+
+
+def _normalize_scalar_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    return str(value)
+
+
+def _to_chinese_value_field_name(field_name: str) -> str:
+    return VALUE_FIELD_LABEL_MAP.get(field_name, field_name)
+
+
+def _to_wide_column_name(
+    element_name: str,
+    value_field_name: str,
+    value_index: int = 1,
+    value_count: int = 1,
+) -> str:
+    zh_field_name = _to_chinese_value_field_name(value_field_name)
+
+    if not zh_field_name or zh_field_name == "值":
+        column_name = element_name
+    elif zh_field_name == element_name:
+        column_name = element_name
+    else:
+        column_name = f"{element_name}_{zh_field_name}"
+
+    if value_count > 1:
+        column_name = f"{column_name}_{value_index}"
+
+    return column_name
+
+
+def _flatten_element_value_rows(
+    element_values: List[Dict[str, Any]],
+    base_row: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+
+    for idx, ev in enumerate(element_values, start=1):
+        if not isinstance(ev, dict):
+            row = dict(base_row)
+            row.update(
+                {
+                    "值序號": str(idx),
+                    "值欄位": "值",
+                    "值內容": _normalize_scalar_value(ev),
+                    "測量單位": "",
+                }
             )
-        
-        # 構建 Prompt - 只要求生成描述內容
-        # 先確定未來一週的星期名稱
-        now = datetime.now()
-        weekday_map = WeatherDataProcessor.WEEKDAY_MAP
-        future_weekdays = []
-        for i in range(1, min(8, len(days))):
-            date_match = re.match(r"\d{2}-\d{2}\(([^)]+)\)", days[i])
-            if date_match:
-                weekday_char = date_match.group(1)
-                weekday_map_dict = {"一": "週一", "二": "週二", "三": "週三", "四": "週四", 
-                                  "五": "週五", "六": "週六", "日": "週日"}
-                day_name = weekday_map_dict.get(weekday_char, f"週{weekday_char}")
-                future_weekdays.append(day_name)
-        
-        future_weekdays_str = "\n".join([f"{day}：[簡短點評]" for day in future_weekdays])
-        
-        system_prompt = f"""你是一個專為機車通勤族服務的氣象助理。
+            rows.append(row)
+            continue
 
-**用戶資料**：住公寓(不用曬衣)、只能騎機車(不要建議大眾運輸)、平日上班(09/19通勤)、晚上/假日才有空。
+        unit = _normalize_scalar_value(ev.get("Measures"))
+        value_keys = [k for k in ev.keys() if k != "Measures" and ev.get(k) is not None]
 
-**任務**：根據提供的天氣數據，生成簡短的描述文字。
-
-**嚴格規則**：
-1. 使用台灣慣用詞彙、語句、繁體中文。
-2. 描述要簡短實用，針對機車通勤族。
-3. **風力**：只有在數據中有出現 [注意: ...] 時才在描述中提到風力，否則**完全不要提風**。
-4. 今日描述：一句話點評今日騎車感受。
-5. 未來一週描述：每天一句簡短點評（針對該天的天氣狀況）。
-6. 貼心提醒：針對整週的騎車通勤建議。
-
-**輸出格式（必須嚴格遵守）**：
-今日描述：[一句話描述今日騎車感受]
-
-未來一週描述：
-{future_weekdays_str}
-
-貼心提醒：[針對整週的騎車通勤建議]
-"""
-        
-        try:
-            logger.info(f"正在呼叫 OpenAI API ({model_name})生成描述...")
-            
-            client = OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": weather_summary}
-                ]
+        if not value_keys:
+            row = dict(base_row)
+            row.update(
+                {
+                    "值序號": str(idx),
+                    "值欄位": "測量單位",
+                    "值內容": unit,
+                    "測量單位": "",
+                }
             )
-            
-            ai_content = response.choices[0].message.content
-            
-            # 解析 AI 返回的內容
-            today_desc = None
-            weekly_descs = []
-            tips_content = None
-            
-            # 提取今日描述
-            today_match = re.search(r"今日描述[：:]\s*(.+?)(?=\n\n|$)", ai_content, re.DOTALL)
-            if today_match:
-                today_desc = today_match.group(1).strip()
-            
-            # 提取未來一週描述
-            weekly_match = re.search(r"未來一週描述[：:]?\s*\n(.*?)(?=\n\n貼心提醒|$)", ai_content, re.DOTALL)
-            if weekly_match:
-                weekly_lines = weekly_match.group(1).strip().split("\n")
-                # 建立星期名稱到描述的映射
-                weekday_desc_map = {}
-                for line in weekly_lines:
-                    line = line.strip()
-                    if not line:
+            rows.append(row)
+            continue
+
+        for key in value_keys:
+            row = dict(base_row)
+            row.update(
+                {
+                    "值序號": str(idx),
+                    "值欄位": _to_chinese_value_field_name(key),
+                    "值內容": _normalize_scalar_value(ev.get(key)),
+                    "測量單位": unit,
+                }
+            )
+            rows.append(row)
+
+    return rows
+
+
+def build_cwa_raw_csv_rows(
+    dataset_id: str,
+    dataset_label: str,
+    data: Dict[str, Any],
+    city: str,
+    townships: List[str],
+) -> List[Dict[str, str]]:
+    locations_list = _ensure_records_locations(data)
+    city_blk = _find_city_block(locations_list, city)
+    locs = city_blk.get("Location") or []
+    target_towns = set(townships or [])
+
+    rows: List[Dict[str, str]] = []
+
+    for loc in locs:
+        town = loc.get("LocationName") or ""
+        if target_towns and town not in target_towns:
+            continue
+
+        for element in loc.get("WeatherElement") or []:
+            element_name = element.get("ElementName") or "未命名天氣要素"
+            time_items = element.get("Time") or []
+
+            for time_item in time_items:
+                base_row = {
+                    "資料集代碼": dataset_id,
+                    "資料集說明": dataset_label,
+                    "縣市": city_blk.get("LocationsName") or city,
+                    "鄉鎮市區": town,
+                    "天氣要素": element_name,
+                    "開始時間": _normalize_scalar_value(time_item.get("StartTime")),
+                    "結束時間": _normalize_scalar_value(time_item.get("EndTime")),
+                    "資料時間": _normalize_scalar_value(time_item.get("DataTime")),
+                    "值序號": "",
+                    "值欄位": "",
+                    "值內容": "",
+                    "測量單位": "",
+                }
+
+                element_values = time_item.get("ElementValue") or []
+                if element_values:
+                    rows.extend(_flatten_element_value_rows(element_values, base_row))
+                else:
+                    rows.append(base_row)
+
+    return rows
+
+
+def export_cwa_raw_csv(output_path: Path, rows: List[Dict[str, str]]) -> None:
+    with output_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info(f"原始資料 CSV 已生成：{output_path}")
+
+
+def build_cwa_raw_wide_rows(
+    dataset_id: str,
+    dataset_label: str,
+    data: Dict[str, Any],
+    city: str,
+    townships: List[str],
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    locations_list = _ensure_records_locations(data)
+    city_blk = _find_city_block(locations_list, city)
+    locs = city_blk.get("Location") or []
+    target_towns = set(townships or [])
+
+    rows_by_key: Dict[Tuple[str, str, str, str], Dict[str, str]] = {}
+    dynamic_fieldnames: List[str] = []
+    dynamic_seen = set()
+
+    def ensure_dynamic_field(field_name: str) -> None:
+        if field_name not in dynamic_seen:
+            dynamic_seen.add(field_name)
+            dynamic_fieldnames.append(field_name)
+
+    for loc in locs:
+        town = loc.get("LocationName") or ""
+        if target_towns and town not in target_towns:
+            continue
+
+        for element in loc.get("WeatherElement") or []:
+            element_name = element.get("ElementName") or "未命名天氣要素"
+            time_items = element.get("Time") or []
+
+            for time_item in time_items:
+                start_time = _normalize_scalar_value(time_item.get("StartTime"))
+                end_time = _normalize_scalar_value(time_item.get("EndTime"))
+                data_time = _normalize_scalar_value(time_item.get("DataTime"))
+                key = (town, start_time, end_time, data_time)
+
+                row = rows_by_key.setdefault(
+                    key,
+                    {
+                        "資料集代碼": dataset_id,
+                        "資料集說明": dataset_label,
+                        "縣市": city_blk.get("LocationsName") or city,
+                        "鄉鎮市區": town,
+                        "開始時間": start_time,
+                        "結束時間": end_time,
+                        "資料時間": data_time,
+                    },
+                )
+
+                element_values = time_item.get("ElementValue") or []
+                if not element_values:
+                    column_name = element_name
+                    ensure_dynamic_field(column_name)
+                    row[column_name] = ""
+                    continue
+
+                value_count = len(element_values)
+                for idx, ev in enumerate(element_values, start=1):
+                    if not isinstance(ev, dict):
+                        column_name = _to_wide_column_name(element_name, "值", idx, value_count)
+                        ensure_dynamic_field(column_name)
+                        row[column_name] = _normalize_scalar_value(ev)
                         continue
-                    # 匹配 "週X：[描述]" 格式
-                    for weekday in ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]:
-                        if line.startswith(weekday):
-                            desc = re.sub(rf"^{weekday}[：:]\s*", "", line).strip()
-                            weekday_desc_map[weekday] = desc
-                            break
-                
-                # 根據實際日期匹配描述（未來一週從索引 1 開始）
-                for i in range(1, min(8, len(days))):
-                    # 從日期字串中提取星期
-                    date_match = re.match(r"\d{2}-\d{2}\(([^)]+)\)", days[i])
-                    if date_match:
-                        weekday_char = date_match.group(1)
-                        weekday_map_dict = {"一": "週一", "二": "週二", "三": "週三", "四": "週四", 
-                                          "五": "週五", "六": "週六", "日": "週日"}
-                        day_name = weekday_map_dict.get(weekday_char, f"週{weekday_char}")
-                        # 將描述添加到對應位置（索引 i-1 因為未來一週從索引 1 開始）
-                        if day_name in weekday_desc_map:
-                            if i-1 < len(weekly_descs):
-                                weekly_descs[i-1] = weekday_desc_map[day_name]
-                            else:
-                                while len(weekly_descs) < i:
-                                    weekly_descs.append(None)
-                                weekly_descs.append(weekday_desc_map[day_name])
-            
-            # 補齊不足的描述（最多 7 天）
-            while len(weekly_descs) < 7:
-                weekly_descs.append(None)
-            
-            # 提取貼心提醒
-            tips_match = re.search(r"貼心提醒[：:]\s*(.+?)(?=\n\n|$)", ai_content, re.DOTALL)
-            if tips_match:
-                tips_content = tips_match.group(1).strip()
-            
-            logger.info("AI 描述生成完成")
-            return today_desc, weekly_descs[:7], tips_content
-            
-        except Exception as e:
-            logger.error(f"AI 描述生成失敗: {e}")
-            return None, [], None
+
+                    value_keys = [k for k in ev.keys() if k != "Measures" and ev.get(k) is not None]
+                    if not value_keys:
+                        column_name = _to_wide_column_name(element_name, "值", idx, value_count)
+                        ensure_dynamic_field(column_name)
+                        row[column_name] = ""
+                        continue
+
+                    for value_key in value_keys:
+                        column_name = _to_wide_column_name(element_name, value_key, idx, value_count)
+                        ensure_dynamic_field(column_name)
+                        row[column_name] = _normalize_scalar_value(ev.get(value_key))
+
+    sorted_rows = sorted(
+        rows_by_key.values(),
+        key=lambda r: (
+            r.get("鄉鎮市區", ""),
+            r.get("開始時間", ""),
+            r.get("資料時間", ""),
+            r.get("結束時間", ""),
+        ),
+    )
+    return sorted_rows, WIDE_BASE_FIELDNAMES + dynamic_fieldnames
+
+
+def export_cwa_raw_wide_csv(
+    output_path: Path,
+    rows: List[Dict[str, str]],
+    fieldnames: List[str],
+) -> None:
+    with output_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info(f"原始資料寬表 CSV 已生成：{output_path}")
+
 
 # ==========================================
-# 結構化文字報告生成
+# 週報（F-D0047-071）彙整為「每日」
+# ==========================================
+
+@dataclass
+class DailyForecast:
+    d: date
+    condition: str
+    tmax: Optional[float]
+    tmin: Optional[float]
+    feel_day: Optional[float]   # 以最高體感代表日間感受
+    feel_night: Optional[float] # 以最低體感代表夜間感受
+    pop: Optional[int]          # 降雨機率（取當日最大）
+    humidity: Optional[float]   # 相對濕度（若有，取平均）
+    desc: Optional[str]
+
+
+def build_weekly_daily_forecast(
+    data_071: Dict[str, Any],
+    city: str,
+    townships: List[str],
+) -> Dict[str, List[DailyForecast]]:
+    """
+    回傳：{ township_name: [DailyForecast, ...] }
+    071 為逐 12 小時；本函數彙整成每日資訊。
+    """
+    locations_list = _ensure_records_locations(data_071)
+    city_blk = _find_city_block(locations_list, city)
+    locs = city_blk.get("Location") or []
+
+    target = {t: [] for t in townships}
+
+    for loc in locs:
+        name = loc.get("LocationName")
+        if name not in target:
+            continue
+
+        idx = _index_weather_elements(loc)
+
+        # 可能的 ElementName（以你先前 fields 為準）
+        # - 天氣現象：Weather / 或 ElementValue 內 Weather
+        # - 最高溫：MaxTemperature
+        # - 最低溫：MinTemperature
+        # - 最高體感：MaxApparentTemperature
+        # - 最低體感：MinApparentTemperature
+        # - 降雨機率：ProbabilityOfPrecipitation
+        # - 相對濕度：RelativeHumidity
+        # - 綜合描述：WeatherDescription
+
+        def collect_series(element_name: str) -> List[Dict[str, Any]]:
+            e = idx.get(element_name)
+            return (e.get("Time") or []) if e else []
+
+        wx_series = collect_series("天氣現象") or collect_series("Weather")
+        tmax_series = collect_series("最高溫度") or collect_series("MaxTemperature")
+        tmin_series = collect_series("最低溫度") or collect_series("MinTemperature")
+        atmax_series = collect_series("最高體感溫度") or collect_series("MaxApparentTemperature")
+        atmin_series = collect_series("最低體感溫度") or collect_series("MinApparentTemperature")
+        pop_series = collect_series("12小時降雨機率") or collect_series("ProbabilityOfPrecipitation")
+        rh_series = collect_series("平均相對濕度") or collect_series("RelativeHumidity")
+        desc_series = collect_series("天氣預報綜合描述") or collect_series("WeatherDescription")
+
+        # 以 StartTime 作為分桶鍵（12 小時一筆）
+        day_bucket: Dict[date, Dict[str, Any]] = {}
+
+        def bucket_by_date(series: List[Dict[str, Any]], kind: str):
+            for it in series:
+                st = it.get("StartTime") or it.get("DataTime")
+                if not st:
+                    continue
+                dt = _parse_dt(st)
+                d0 = dt.date()
+                b = day_bucket.setdefault(d0, {"wx": [], "tmax": [], "tmin": [], "atmax": [], "atmin": [], "pop": [], "rh": [], "desc": []})
+                b[kind].append(it)
+
+        bucket_by_date(wx_series, "wx")
+        bucket_by_date(tmax_series, "tmax")
+        bucket_by_date(tmin_series, "tmin")
+        bucket_by_date(atmax_series, "atmax")
+        bucket_by_date(atmin_series, "atmin")
+        bucket_by_date(pop_series, "pop")
+        bucket_by_date(rh_series, "rh")
+        bucket_by_date(desc_series, "desc")
+
+        # 依日期排序
+        days = sorted(day_bucket.keys())
+        out: List[DailyForecast] = []
+
+        for d0 in days[:7]:
+            b = day_bucket[d0]
+
+            # 天氣：選當日第一筆 Weather
+            condition = None
+            if b["wx"]:
+                ev = (b["wx"][0].get("ElementValue") or [{}])[0]
+                condition = ev.get("Weather") or ev.get("value") or ev.get("Wx") or None
+            condition = condition or "—"
+
+            # 最高/最低溫：取當日所有值的 max/min
+            def extract_float(items: List[Dict[str, Any]], key: str) -> List[float]:
+                vals = []
+                for it in items:
+                    ev = (it.get("ElementValue") or [{}])[0]
+                    v = ev.get(key)
+                    if v is None:
+                        continue
+                    try:
+                        vals.append(float(v))
+                    except Exception:
+                        continue
+                return vals
+
+            tmax_vals = extract_float(b["tmax"], "MaxTemperature") or extract_float(b["tmax"], "Temperature")
+            tmin_vals = extract_float(b["tmin"], "MinTemperature") or extract_float(b["tmin"], "Temperature")
+            atmax_vals = extract_float(b["atmax"], "MaxApparentTemperature") or extract_float(b["atmax"], "ApparentTemperature")
+            atmin_vals = extract_float(b["atmin"], "MinApparentTemperature") or extract_float(b["atmin"], "ApparentTemperature")
+
+            # 降雨機率：取最大
+            pop_vals = []
+            for it in b["pop"]:
+                ev = (it.get("ElementValue") or [{}])[0]
+                v = ev.get("ProbabilityOfPrecipitation")
+                if v is None:
+                    continue
+                try:
+                    pop_vals.append(int(float(v)))
+                except Exception:
+                    continue
+
+            # 濕度：取平均
+            rh_vals = []
+            for it in b["rh"]:
+                ev = (it.get("ElementValue") or [{}])[0]
+                v = ev.get("RelativeHumidity")
+                if v is None:
+                    continue
+                try:
+                    rh_vals.append(float(v))
+                except Exception:
+                    continue
+
+            # 描述：選當日第一筆
+            desc = None
+            if b["desc"]:
+                ev = (b["desc"][0].get("ElementValue") or [{}])[0]
+                desc = ev.get("WeatherDescription") or ev.get("value")
+
+            out.append(
+                DailyForecast(
+                    d=d0,
+                    condition=condition,
+                    tmax=max(tmax_vals) if tmax_vals else None,
+                    tmin=min(tmin_vals) if tmin_vals else None,
+                    feel_day=max(atmax_vals) if atmax_vals else None,
+                    feel_night=min(atmin_vals) if atmin_vals else None,
+                    pop=max(pop_vals) if pop_vals else None,
+                    humidity=float(np.mean(rh_vals)) if rh_vals else None,
+                    desc=desc,
+                )
+            )
+
+        target[name] = out
+
+    return target
+
+
+# ==========================================
+# 近三天（F-D0047-069）用於「今日概況/風力提醒」
+# ==========================================
+
+@dataclass
+class ShortTermSnapshot:
+    today_desc: Optional[str]
+    wind_warning: Optional[str]
+
+
+def build_today_snapshot_and_wind_warning(
+    data_069: Dict[str, Any],
+    city: str,
+    townships: List[str],
+) -> Dict[str, ShortTermSnapshot]:
+    """
+    回傳每個鄉鎮：
+    - today_desc：取「天氣預報綜合描述」中，最接近現在的一個 3 小時區間文字
+    - wind_warning：取未來 24 小時最大風速（m/s -> km/h）作為警示依據
+    """
+    now = datetime.now()
+    locations_list = _ensure_records_locations(data_069)
+    city_blk = _find_city_block(locations_list, city)
+    locs = city_blk.get("Location") or []
+
+    out: Dict[str, ShortTermSnapshot] = {}
+
+    for loc in locs:
+        name = loc.get("LocationName")
+        if name not in townships:
+            continue
+
+        idx = _index_weather_elements(loc)
+
+        # 風速（3小時）
+        wind_series = (idx.get("風速") or idx.get("WindSpeed") or {}).get("Time") or []
+        # 綜合描述（3小時）
+        desc_series = (idx.get("天氣預報綜合描述") or idx.get("WeatherDescription") or {}).get("Time") or []
+
+        # 1) today_desc：找離 now 最近的 StartTime
+        best_desc = None
+        best_dt_diff = None
+        for it in desc_series:
+            st = it.get("StartTime") or it.get("DataTime")
+            if not st:
+                continue
+            dt0 = _parse_dt(st)
+            diff = abs((dt0 - now).total_seconds())
+            if best_dt_diff is None or diff < best_dt_diff:
+                ev = (it.get("ElementValue") or [{}])[0]
+                best_desc = ev.get("WeatherDescription") or ev.get("value")
+                best_dt_diff = diff
+
+        # 2) wind_warning：未來 24 小時最大風速
+        max_wind_ms = None
+        horizon = now + timedelta(hours=24)
+        for it in wind_series:
+            st = it.get("DataTime") or it.get("StartTime")
+            if not st:
+                continue
+            dt0 = _parse_dt(st)
+            if dt0 < now or dt0 > horizon:
+                continue
+            ev = (it.get("ElementValue") or [{}])[0]
+            ws = ev.get("WindSpeed")
+            if ws is None:
+                continue
+            try:
+                ws_ms = float(ws)
+            except Exception:
+                continue
+            if max_wind_ms is None or ws_ms > max_wind_ms:
+                max_wind_ms = ws_ms
+
+        wind_warning = None
+        if max_wind_ms is not None:
+            wind_kmh = max_wind_ms * 3.6
+            wind_warning = WindWarningSystem.get_warning(wind_kmh) or None
+
+        out[name] = ShortTermSnapshot(today_desc=best_desc, wind_warning=wind_warning)
+
+    return out
+
+
+# ==========================================
+# 報表輸出：圖表
+# ==========================================
+
+def generate_image_report(
+    output_path: Path,
+    days: List[str],
+    tmax: List[Optional[float]],
+    tmin: List[Optional[float]],
+    day_feels: List[Optional[float]],
+    night_feels: List[Optional[float]],
+    conditions: List[str],
+    rain_probs: List[Optional[int]],
+    humidities: List[Optional[float]],
+) -> None:
+    if plt is None:
+        logger.warning(f"matplotlib 不可用，跳過圖表報表生成：{MATPLOTLIB_IMPORT_ERROR}")
+        return
+
+    fig, (ax_table, ax_chart) = plt.subplots(
+        nrows=2, ncols=1, figsize=(12, 10),
+        gridspec_kw={"height_ratios": [0.8, 1]},
+        facecolor="white",
+    )
+
+    # 表格
+    ax_table.axis("off")
+    ax_table.set_title("未來 7 天天氣預報 (CWA)", fontsize=16, pad=20, weight="bold")
+
+    columns = ("日期", "天氣", "最高溫\n(°C)", "最低溫\n(°C)", "體感(°C)\n日/夜", "降雨\n(%)", "濕度\n(%)")
+    cell_text = []
+
+    for i in range(len(days)):
+        d_feel = f"{day_feels[i]:.1f}" if day_feels[i] is not None else "-"
+        n_feel = f"{night_feels[i]:.1f}" if night_feels[i] is not None else "-"
+        feel_str = f"{d_feel} / {n_feel}"
+
+        tmax_str = f"{tmax[i]:.0f}" if tmax[i] is not None else "-"
+        tmin_str = f"{tmin[i]:.0f}" if tmin[i] is not None else "-"
+        pop_str = f"{rain_probs[i]:.0f}" if rain_probs[i] is not None else "-"
+        rh_str = f"{humidities[i]:.0f}" if humidities[i] is not None else "-"
+
+        cell_text.append([days[i], conditions[i], tmax_str, tmin_str, feel_str, pop_str, rh_str])
+
+    table = ax_table.table(
+        cellText=cell_text,
+        colLabels=columns,
+        loc="center",
+        cellLoc="center",
+        bbox=[0.05, 0.1, 0.9, 0.8],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+
+    # 表格樣式
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_facecolor("#4A90E2")
+            cell.set_text_props(weight="bold", color="white")
+        elif row % 2 == 0:
+            cell.set_facecolor("#f9f9f9")
+        if col == 4 and row > 0:
+            cell.set_text_props(weight="bold", color="#d62728")
+
+    # 折線圖
+    ax_chart.set_facecolor("white")
+
+    # 只畫有值的（避免 None 造成斷線）
+    x = np.arange(len(days))
+
+    def _plot_series(y, label, marker, linestyle):
+        yv = np.array([np.nan if v is None else float(v) for v in y], dtype=float)
+        ax_chart.plot(days, yv, marker=marker, label=label, linestyle=linestyle, linewidth=2.5, alpha=0.8)
+
+    _plot_series(tmax, "最高溫", "o", "-")
+    _plot_series(tmin, "最低溫", "o", "-")
+    _plot_series(day_feels, "白天體感", "^", "--")
+    _plot_series(night_feels, "夜間體感", "v", ":")
+
+    ax_chart.set_xlabel("日期", fontsize=12)
+    ax_chart.set_ylabel("溫度 (°C)", fontsize=12)
+    ax_chart.set_title("氣溫與體感走勢", fontsize=14, weight="bold")
+    ax_chart.grid(True, linestyle="--", alpha=0.3)
+    ax_chart.legend(loc="best", framealpha=0.9)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, facecolor="white", bbox_inches="tight")
+    plt.close()
+    logger.info(f"圖表已生成：{output_path}")
+
+
+# ==========================================
+# 報表輸出：純文字（LINE 友善）
 # ==========================================
 
 class StructuredTextReportGenerator:
-    """結構化文字報告生成器（基於 YAML 範例格式）"""
-    
-    # 天氣圖示映射
     ICON_MAP = {
-        "晴朗": "☀️",
-        "晴時多雲": "🌤️",
+        "晴": "☀️",
         "多雲": "☁️",
-        "陰天": "☁️",
+        "陰": "☁️",
+        "雨": "🌧️",
+        "雷": "⛈️",
         "霧": "🌫️",
-        "毛毛雨": "🌦️",
-        "小雨": "🌧️",
-        "中雨": "🌧️",
-        "大雨": "⛈️",
-        "陣雨": "🌦️",
-        "強陣雨": "⛈️",
-        "雷雨": "⛈️"
     }
-    
+
     @classmethod
     def get_icon(cls, condition: str) -> str:
-        """根據天氣狀況獲取圖示"""
-        for key, icon in cls.ICON_MAP.items():
-            if key in condition:
+        for k, icon in cls.ICON_MAP.items():
+            if k in condition:
                 return icon
-        return "☁️"  # 預設圖示
-    
-    
+        return "☁️"
+
     @classmethod
-    def generate_structured_text_report(
+    def generate(
         cls,
         output_path: Path,
+        township: str,
         today_desc: Optional[str],
-        weekly_descs: List[Optional[str]],
-        tips_content: Optional[str],
-        days: List[str],
-        conditions: List[str],
-        tmax: List[float],
-        tmin: List[float],
-        rain_probs: List[int],
-        day_feels: List[Optional[float]],
-        night_feels: List[Optional[float]]
+        wind_warning: Optional[str],
+        daily: List[DailyForecast],
     ) -> None:
-        """生成結構化文字報告（適合人類閱讀的格式）"""
-        
-        # 生成日期標題
         now = datetime.now()
-        weekday_map = WeatherDataProcessor.WEEKDAY_MAP
-        today_str = f"{now.strftime('%m-%d')}({weekday_map[now.weekday()]})"
-        
-        # 構建文字報告內容（適合人類閱讀的格式）
-        lines = []
-        lines.append(f"{today_str} 氣象日報")
+        weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
+        today_title = f"{now.strftime('%m-%d')}({weekday_map[now.weekday()]}) 氣象日報 - {township}"
+
+        lines: List[str] = []
+        lines.append(today_title)
         lines.append("")
         lines.append("🌤️ 今日概況")
-        
-        # 今日圖示
-        today_icon = cls.get_icon(conditions[0]) if conditions else "☁️"
-        
-        # 今日氣溫
-        if len(tmin) > 0 and len(tmax) > 0:
-            temp_str = f"氣溫：{round(tmin[0], 1)}~{round(tmax[0], 1)}°C"
+
+        if daily:
+            d0 = daily[0]
+            tmin = f"{d0.tmin:.0f}" if d0.tmin is not None else "N/A"
+            tmax = f"{d0.tmax:.0f}" if d0.tmax is not None else "N/A"
+            lines.append(f"氣溫：{tmin}~{tmax}°C")
+
+            fd = f"{d0.feel_day:.0f}" if d0.feel_day is not None else "N/A"
+            fn = f"{d0.feel_night:.0f}" if d0.feel_night is not None else "N/A"
+            lines.append(f"體感：日 {fd}°C / 夜 {fn}°C")
+
+            pop = f"{d0.pop:d}%" if d0.pop is not None else "N/A"
+            lines.append(f"降雨機率：{pop}")
         else:
-            temp_str = "氣溫：N/A"
-        lines.append(temp_str)
-        
-        # 今日體感
-        if day_feels and day_feels[0] is not None and night_feels and night_feels[0] is not None:
-            feel_str = f"體感：日 {round(day_feels[0], 1)}°C / 夜 {round(night_feels[0], 1)}°C"
-        elif day_feels and day_feels[0] is not None:
-            feel_str = f"體感：日 {round(day_feels[0], 1)}°C / 夜 N/A"
-        elif night_feels and night_feels[0] is not None:
-            feel_str = f"體感：日 N/A / 夜 {round(night_feels[0], 1)}°C"
+            lines.append("氣溫：N/A")
+            lines.append("體感：N/A")
+            lines.append("降雨機率：N/A")
+
+        if today_desc:
+            lines.append(today_desc)
         else:
-            feel_str = "體感：N/A"
-        lines.append(feel_str)
-        
-        # 今日降雨
-        if len(rain_probs) > 0:
-            rain_str = f"降雨機率：{rain_probs[0]}%"
-        else:
-            rain_str = "降雨機率：N/A"
-        lines.append(rain_str)
-        
-        # 今日描述
-        desc = today_desc or "無特殊提醒"
-        lines.append(f"{desc}")
+            lines.append("無特殊提醒")
+
+        if wind_warning:
+            lines.append("")
+            lines.append("🛵 風力提醒")
+            lines.append(wind_warning)
+
         lines.append("")
-        
-        # 未來一週預報
         lines.append("📅 未來一週")
-        
-        weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
-        
-        for i in range(1, min(8, len(days))):
-            # 從日期字串中提取 MM-DD 和星期
-            date_match = re.match(r"(\d{2}-\d{2})\(([^)]+)\)", days[i])
-            if date_match:
-                date_str = date_match.group(1)
-                weekday_char = date_match.group(2)
-                # 將星期字元轉換為星期名稱
-                weekday_map_dict = {"一": "週一", "二": "週二", "三": "週三", "四": "週四", 
-                                   "五": "週五", "六": "週六", "日": "週日"}
-                day_name = weekday_map_dict.get(weekday_char, f"週{weekday_char}")
-            else:
-                date_str = days[i]
-                day_name = weekday_names[i % 7] if i < len(weekday_names) else f"週{(i % 7) + 1}"
-            
-            # 圖示
-            icon = cls.get_icon(conditions[i]) if i < len(conditions) else "☁️"
-            
-            # 氣溫
-            if i < len(tmin) and i < len(tmax):
-                temp_info = f"氣溫 {round(tmin[i], 1)}-{round(tmax[i], 1)}°C"
-            else:
-                temp_info = "氣溫 N/A"
-            
-            # 體感
-            if i < len(day_feels) and day_feels[i] is not None and i < len(night_feels) and night_feels[i] is not None:
-                feel_info = f"體感 {round(day_feels[i], 1)}-{round(night_feels[i], 1)}°C"
-            elif i < len(day_feels) and day_feels[i] is not None:
-                feel_info = f"體感 {round(day_feels[i], 1)}°C"
-            elif i < len(night_feels) and night_feels[i] is not None:
-                feel_info = f"體感 {round(night_feels[i], 1)}°C"
-            else:
-                feel_info = "體感 N/A"
-            
-            # 降雨
-            if i < len(rain_probs):
-                rain_info = f"降雨 {rain_probs[i]}%"
-            else:
-                rain_info = "降雨 N/A"
-            
-            # 描述
-            desc = weekly_descs[i-1] if (i-1 < len(weekly_descs) and weekly_descs[i-1]) else "無特殊提醒"
-            
-            # 組合成一行
-            forecast_line = f"- {day_name}({date_str})：{icon} {temp_info} / {feel_info} / {rain_info}"
-            if desc and desc != "無特殊提醒":
-                forecast_line += f"（{desc}）"
-            lines.append(forecast_line)
-        
+
+        # 從第二天開始列（避免與今日重複）
+        for i in range(1, min(7, len(daily))):
+            di = daily[i]
+            day_name = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"][di.d.weekday()]
+            icon = cls.get_icon(di.condition)
+
+            tmin = f"{di.tmin:.0f}" if di.tmin is not None else "-"
+            tmax = f"{di.tmax:.0f}" if di.tmax is not None else "-"
+            fd = f"{di.feel_day:.0f}" if di.feel_day is not None else "-"
+            fn = f"{di.feel_night:.0f}" if di.feel_night is not None else "-"
+            pop = f"{di.pop:d}%" if di.pop is not None else "N/A"
+
+            line = f"- {day_name}({_to_mmdd_weekday(di.d)[:5]})：{icon} 氣溫 {tmin}-{tmax}°C / 體感 {fd}-{fn}°C / 降雨 {pop}"
+            if di.desc:
+                # 控制長度，避免 LINE 太長
+                short = di.desc.strip()
+                if len(short) > 60:
+                    short = short[:60] + "..."
+                line += f"（{short}）"
+            lines.append(line)
+
         lines.append("")
         lines.append("💡 貼心提醒")
-        
-        # 貼心提醒內容
-        tips = tips_content or "無特殊提醒"
-        for tip_line in tips.split("\n"):
-            if tip_line.strip():
-                lines.append(tip_line.strip())
-        
-        # 寫入文字文件
-        try:
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-            logger.info(f"結構化文字報告已生成: {output_path}")
-        except Exception as e:
-            logger.error(f"生成結構化文字報告失敗: {e}")
-            raise
+        lines.append("1) 以「降雨機率」作為通勤決策參考，雨天請穿著雨衣並注意視線。")
+        lines.append("2) 風速/陣風升高時，高架、橋面、路口與大型車旁邊請降低速度。")
+        lines.append("3) 體感溫度較低時，請注意手套與保暖層，避免受寒。")
+
+        output_path.write_text("\n".join(lines), encoding="utf-8")
+        logger.info(f"文字報告已生成：{output_path}")
+
 
 # ==========================================
-# 主程式
+# 主流程
 # ==========================================
 
-def main():
-    """主程式入口"""
-    try:
-        logger.info("=" * 50)
-        logger.info("天氣預報系統啟動")
-        logger.info("=" * 50)
-        
-        # 初始化配置（從 YAML 載入）
-        config = Config.load_from_yaml(SYSTEM_CONFIG_PATH)
-        logger.info(f"載入配置：位置 ({config.lat}, {config.lon}), 時區 {config.timezone}")
-        setup_font(config)
-        
-        # 獲取天氣數據
-        logger.info("正在獲取天氣數據...")
-        data = WeatherDataProcessor.fetch_weather_data(config.api_url)
-        
-        # 處理基礎數據
-        processor = WeatherDataProcessor
-        days = [processor.format_date(d) for d in data["daily"]["time"]]
-        tmax = data["daily"]["temperature_2m_max"]
-        tmin = data["daily"]["temperature_2m_min"]
-        weather_codes = data["daily"]["weathercode"]
-        conditions = [processor.get_weather_description(c) for c in weather_codes]
-        rain_probs = data["daily"]["precipitation_probability_max"]
-        max_winds = data["daily"]["windspeed_10m_max"]
-        humidities = processor.compute_daily_average(data, "relative_humidity_2m")
-        
-        # 計算體感溫度
-        logger.info("計算體感溫度...")
-        day_feels, night_feels = processor.process_real_feel_temperatures(data)
-        
-        # 生成圖表報告
-        logger.info("生成圖表報告...")
-        img_path = OUTPUT_DIR / "weather_report.png"
-        WeatherReportGenerator.generate_image_report(
-            img_path, days, tmax, tmin, day_feels, night_feels,
-            conditions, rain_probs, humidities
+def main() -> None:
+    logger.info("=" * 60)
+    logger.info("CWA 天氣預報系統啟動")
+    logger.info("=" * 60)
+
+    cfg = Config.load_from_yaml(CONFIG_PATH)
+    setup_font(cfg)
+
+    api_key = load_cwa_api_key(ENV_PATH)
+    client = CWAClient(api_key)
+
+    # 1) 拉資料：3 天（3 小時） + 1 週（12 小時）
+    logger.info("正在取得 F-D0047-069（3天/3小時）資料...")
+    data_069 = client.get(
+        cfg.dataset_3day,
+        params={
+            "LocationsName": cfg.city,
+            # LocationName 支援多個同名參數
+            **{f"LocationName": cfg.townships[0]}  # 先放一個，後面用 requests 的 list 形式更保險
+        },
+    )
+
+    # requests params 需要 list 才能帶多個同名 key；因此改用第二次呼叫（更乾淨）
+    # 這樣可確保多個鄉鎮都會回傳
+    data_069 = client.get(
+        cfg.dataset_3day,
+        params={
+            "LocationsName": cfg.city,
+            "LocationName": cfg.townships,  # list -> LocationName=...&LocationName=...
+        },
+    )
+
+    logger.info("正在取得 F-D0047-071（1週/12小時）資料...")
+    data_071 = client.get(
+        cfg.dataset_1week,
+        params={
+            "LocationsName": cfg.city,
+            "LocationName": cfg.townships,
+        },
+    )
+
+    # 1.5) 輸出原始資料 CSV（各資料集各兩份：long / wide）
+    raw_069_long = build_cwa_raw_csv_rows(
+        cfg.dataset_3day,
+        "未來3天預報（逐3小時）",
+        data_069,
+        cfg.city,
+        cfg.townships,
+    )
+    raw_071_long = build_cwa_raw_csv_rows(
+        cfg.dataset_1week,
+        "未來1週預報（逐12小時）",
+        data_071,
+        cfg.city,
+        cfg.townships,
+    )
+    export_cwa_raw_csv(OUTPUT_DIR / "weather_raw_069_long.csv", raw_069_long)
+    export_cwa_raw_csv(OUTPUT_DIR / "weather_raw_071_long.csv", raw_071_long)
+
+    raw_069_wide_rows, raw_069_wide_fields = build_cwa_raw_wide_rows(
+        cfg.dataset_3day,
+        "未來3天預報（逐3小時）",
+        data_069,
+        cfg.city,
+        cfg.townships,
+    )
+    raw_071_wide_rows, raw_071_wide_fields = build_cwa_raw_wide_rows(
+        cfg.dataset_1week,
+        "未來1週預報（逐12小時）",
+        data_071,
+        cfg.city,
+        cfg.townships,
+    )
+    export_cwa_raw_wide_csv(OUTPUT_DIR / "weather_raw_069.csv", raw_069_wide_rows, raw_069_wide_fields)
+    export_cwa_raw_wide_csv(OUTPUT_DIR / "weather_raw_071.csv", raw_071_wide_rows, raw_071_wide_fields)
+
+    # 2) 彙整：週報（每日） + 今日概況/風力提醒
+    weekly_by_town = build_weekly_daily_forecast(data_071, cfg.city, cfg.townships)
+    snapshot_by_town = build_today_snapshot_and_wind_warning(data_069, cfg.city, cfg.townships)
+
+    # 3) 產生輸出（每個鄉鎮一份文字報告；圖表以第一個鄉鎮為主）
+    #    你若要把兩個鄉鎮都畫成圖，可擴充為多張圖或合併圖。
+    if not cfg.townships:
+        raise ValueError("config.yaml 未設定任何 townships/districts")
+
+    primary = cfg.townships[0]
+    daily = weekly_by_town.get(primary, [])
+    if not daily:
+        raise RuntimeError(f"未取得 {primary} 的 1 週資料，請檢查 LocationName 是否正確")
+
+    days = [_to_mmdd_weekday(x.d) for x in daily[:7]]
+    conditions = [x.condition for x in daily[:7]]
+    tmax = [x.tmax for x in daily[:7]]
+    tmin = [x.tmin for x in daily[:7]]
+    day_feels = [x.feel_day for x in daily[:7]]
+    night_feels = [x.feel_night for x in daily[:7]]
+    rain_probs = [x.pop for x in daily[:7]]
+    humidities = [x.humidity for x in daily[:7]]
+
+    # 圖表
+    img_path = OUTPUT_DIR / "weather_report.png"
+    generate_image_report(img_path, days, tmax, tmin, day_feels, night_feels, conditions, rain_probs, humidities)
+
+    # 文字（每個鄉鎮一份；同名覆蓋可以自行改檔名）
+    for town in cfg.townships:
+        dlist = weekly_by_town.get(town, [])
+        snap = snapshot_by_town.get(town, ShortTermSnapshot(today_desc=None, wind_warning=None))
+
+        txt_path = OUTPUT_DIR / f"weather_analysis_{town}.txt"
+        StructuredTextReportGenerator.generate(
+            txt_path,
+            township=town,
+            today_desc=snap.today_desc,
+            wind_warning=snap.wind_warning,
+            daily=dlist,
         )
-        
-        # 生成 AI 描述內容
-        api_key, model = AIReportGenerator.load_api_config(CONFIG_PATH)
-        today_desc = None
-        weekly_descs = []
-        tips_content = None
-        
-        if api_key:
-            logger.info("生成 AI 描述內容...")
-            today_desc, weekly_descs, tips_content = AIReportGenerator.generate_ai_descriptions(
-                api_key, model, days, conditions,
-                tmax, tmin, rain_probs, day_feels, night_feels, max_winds
-            )
-        else:
-            logger.warning("未設定 OpenAI API Key，跳過 AI 描述生成")
-        
-        # 生成結構化文字報告（基於 YAML 範例格式，輸出為 .txt）
-        logger.info("生成結構化文字報告（對應 YAML 範例格式）...")
-        structured_txt_path = OUTPUT_DIR / "weather_analysis.txt"
-        StructuredTextReportGenerator.generate_structured_text_report(
-            structured_txt_path, today_desc, weekly_descs, tips_content,
-            days, conditions, tmax, tmin, rain_probs, day_feels, night_feels
-        )
-        
-        logger.info("=" * 50)
-        logger.info("天氣預報系統執行完成")
-        logger.info("=" * 50)
-        
-    except Exception as e:
-        logger.error(f"執行過程中發生錯誤: {e}", exc_info=True)
-        raise
+
+    # 兼容：仍輸出原檔名（用 primary 代表）
+    (OUTPUT_DIR / "weather_analysis.txt").write_text(
+        (OUTPUT_DIR / f"weather_analysis_{primary}.txt").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    logger.info("=" * 60)
+    logger.info("執行完成")
+    logger.info("=" * 60)
+
 
 if __name__ == "__main__":
     main()

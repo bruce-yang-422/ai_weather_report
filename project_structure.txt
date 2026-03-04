@@ -1,7 +1,8 @@
 📁 ai_weather_report
 ├── 📁 .venv
 ├── 📂 config
-│   └── 📋 Weather_descriptions_API_keys.json
+│   ├── 📋 Weather_descriptions_API_keys.json
+│   └── 📋 config.yaml
 ├── 📂 mapping
 │   └── 📋 weather_analysis.yaml
 ├── 📂 output
@@ -10,6 +11,9 @@
 │   └── 🖼️ weather_report.png
 ├── 📂 scripts
 │   └── 🐍 weather.py
+├── 📜 LICENSE
+├── 📖 README.md
+├── 🔧 cwa_api.env
 ├── 📄 project_structure.txt
 ├── 🐍 project_tree_generator.py
 └── 📋 requirements.txt
