@@ -4,7 +4,7 @@
 [![GitHub last commit](https://img.shields.io/github/last-commit/bruce-yang-422/ai_weather_report)](https://github.com/bruce-yang-422/ai_weather_report/commits/main)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 
-自動從**中央氣象署（CWA）開放資料平台**抓取天氣預報，產出圖表與文字報告，針對機車通勤族設計。
+自動從**中央氣象署（CWA）開放資料平台**抓取天氣預報，產出圖表與文字報告，針對機車通勤族設計。當 CWA API 維護或暫時失敗時，可自動切換至 **Open-Meteo** 備援來源。
 
 ---
 
@@ -15,6 +15,7 @@
 - **圖像化天氣報表**：未來 7 日最高 / 最低溫、體感溫度趨勢圖（`weather_report.png`）
 - **文字報告**：逐區天氣日報，含今日概況、未來一週預覽、機車通勤貼心提醒
 - **API 金鑰保護**：憑證存於 `cwa_api.env`，已列入 `.gitignore` 不會上傳 GitHub
+- **備援資料源**：CWA 失敗時可改用 Open-Meteo 產生一週報表與今日提醒
 
 ---
 
@@ -71,7 +72,11 @@ CWA_SKIP_SSL_VERIFY=true   # 若遇到 SSL 驗證失敗可啟用
 {
   "location": {
     "city": "新北市",
-    "townships": ["五股區", "泰山區"]
+    "townships": ["五股區", "泰山區"],
+    "open_meteo_coords": {
+      "五股區": { "latitude": 25.0827, "longitude": 121.4381 },
+      "泰山區": { "latitude": 25.0589, "longitude": 121.4316 }
+    }
   },
   "font": {
     "path": "C:\\Windows\\Fonts\\msjh.ttc",
@@ -81,6 +86,7 @@ CWA_SKIP_SSL_VERIFY=true   # 若遇到 SSL 驗證失敗可啟用
 ```
 
 > `townships` 可新增或移除行政區，每個區會各自產出一份文字報告。
+> `open_meteo_coords` 用於 CWA API 失敗時的 Open-Meteo 備援，新增行政區時請一併設定對應經緯度。
 
 ---
 
@@ -138,6 +144,7 @@ Windows 也可直接執行：
 - **天氣資料**：[中央氣象署開放資料平台](https://opendata.cwa.gov.tw/)
   - `F-D0047-069`：3 天逐 3 小時鄉鎮預報
   - `F-D0047-071`：1 週逐 12 小時鄉鎮預報
+- **備援資料**：[Open-Meteo Forecast API](https://open-meteo.com/en/docs)
 
 ---
 

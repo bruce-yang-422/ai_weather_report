@@ -1,7 +1,17 @@
 {
   "location": {
     "city": "新北市",
-    "townships": ["五股區", "泰山區"]
+    "townships": ["五股區", "泰山區"],
+    "open_meteo_coords": {
+      "五股區": {
+        "latitude": 25.0827,
+        "longitude": 121.4381
+      },
+      "泰山區": {
+        "latitude": 25.0589,
+        "longitude": 121.4316
+      }
+    }
   },
   "font": {
     "path": "C:\\Windows\\Fonts\\msjh.ttc",

@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -54,10 +55,12 @@ except ImportError as exc:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
+CACHE_DIR = OUTPUT_DIR / "cache"
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 ENV_PATH = PROJECT_ROOT / "cwa_api.env"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,6 +134,50 @@ def _parse_bool_env_value(value: Optional[str], default: bool = False) -> bool:
     return default
 
 
+def _cache_file_path(dataset_id: str) -> Path:
+    return CACHE_DIR / f"{dataset_id}.json"
+
+
+def save_dataset_cache(dataset_id: str, data: Dict[str, Any]) -> None:
+    payload = {
+        "cached_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset_id": dataset_id,
+        "data": data,
+    }
+    _cache_file_path(dataset_id).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("已更新快取：%s", _cache_file_path(dataset_id))
+
+
+def load_dataset_cache(dataset_id: str) -> Optional[Dict[str, Any]]:
+    cache_path = _cache_file_path(dataset_id)
+    if not cache_path.exists():
+        return None
+
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("讀取快取失敗，略過 %s：%s", cache_path, exc)
+        return None
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    cached_at = payload.get("cached_at") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        logger.warning("快取格式不正確，略過 %s", cache_path)
+        return None
+
+    logger.warning("已改用快取資料：%s%s", dataset_id, f"（cached_at={cached_at}）" if cached_at else "")
+    return data
+
+
+DEFAULT_OPEN_METEO_COORDS: Dict[str, Dict[str, float]] = {
+    "五股區": {"latitude": 25.0827, "longitude": 121.4381},
+    "泰山區": {"latitude": 25.0589, "longitude": 121.4316},
+}
+
+
 # ==========================================
 # 配置
 # ==========================================
@@ -140,6 +187,7 @@ class Config:
     # 基本：地點
     city: str = "新北市"
     townships: List[str] = None  # 例如 ["五股區", "泰山區"]
+    open_meteo_coords: Dict[str, Dict[str, float]] = None
 
     # 字型（Windows 預設）
     font_path: str = r"C:\Windows\Fonts\msjh.ttc"
@@ -152,6 +200,8 @@ class Config:
     def __post_init__(self):
         if self.townships is None:
             self.townships = ["五股區", "泰山區"]
+        if self.open_meteo_coords is None:
+            self.open_meteo_coords = dict(DEFAULT_OPEN_METEO_COORDS)
         if self.fallback_fonts is None:
             self.fallback_fonts = ["Microsoft JhengHei", "SimHei"]
 
@@ -167,12 +217,19 @@ class Config:
 
             city = loc.get("city", "新北市")
             townships = loc.get("townships") or ["五股區", "泰山區"]
+            open_meteo_coords = loc.get("open_meteo_coords") or dict(DEFAULT_OPEN_METEO_COORDS)
 
             font = data.get("font", {}) if isinstance(data, dict) else {}
             font_path = font.get("path", r"C:\Windows\Fonts\msjh.ttc")
             fallback = font.get("fallback", ["Microsoft JhengHei", "SimHei"])
 
-            return cls(city=city, townships=townships, font_path=font_path, fallback_fonts=fallback)
+            return cls(
+                city=city,
+                townships=townships,
+                open_meteo_coords=open_meteo_coords,
+                font_path=font_path,
+                fallback_fonts=fallback,
+            )
         except Exception as e:
             logger.error(f"讀取配置檔失敗：{e}，使用預設值")
             return cls()
@@ -224,20 +281,89 @@ class WindWarningSystem:
 
 class CWAClient:
     BASE = "https://opendata.cwa.gov.tw/api/v1/rest/datastore"
+    RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
-    def __init__(self, api_key: str, timeout: int = 15, skip_ssl_verify: bool = False):
+    def __init__(
+        self,
+        api_key: str,
+        timeout: int = 15,
+        skip_ssl_verify: bool = False,
+        max_retries: int = 3,
+        retry_backoff_seconds: float = 1.0,
+    ):
         self.api_key = api_key
         self.timeout = timeout
         self.skip_ssl_verify = skip_ssl_verify
+        self.max_retries = max(1, max_retries)
+        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+
+    def _get_with_retry(
+        self,
+        url: str,
+        params: Dict[str, Any],
+        headers: Dict[str, str],
+        verify: bool,
+    ) -> requests.Response:
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=self.timeout,
+                    verify=verify,
+                )
+                if resp.status_code in self.RETRY_STATUS_CODES:
+                    raise requests.exceptions.HTTPError(
+                        f"HTTP {resp.status_code}",
+                        response=resp,
+                    )
+                return resp
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+
+                status_code = None
+                if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+                    status_code = exc.response.status_code
+
+                is_retryable_http = status_code in self.RETRY_STATUS_CODES
+                is_retryable_network = isinstance(
+                    exc,
+                    (
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                    ),
+                )
+
+                if attempt >= self.max_retries or not (is_retryable_http or is_retryable_network):
+                    raise
+
+                wait = self.retry_backoff_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "CWA API 請求失敗（第 %d/%d 次，%s），%.1f 秒後重試...",
+                    attempt,
+                    self.max_retries,
+                    f"HTTP {status_code}" if status_code else exc.__class__.__name__,
+                    wait,
+                )
+                if wait > 0:
+                    time.sleep(wait)
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("CWA API 請求失敗：未知錯誤")
 
     def get(self, dataset_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.BASE}/{dataset_id}"
-        merged = {"Authorization": self.api_key, "format": "JSON"}
+        merged = {"format": "JSON"}
         merged.update(params)
+        headers = {"Authorization": self.api_key}
 
         if self.skip_ssl_verify:
             urllib3.disable_warnings(InsecureRequestWarning)
-            resp = requests.get(url, params=merged, timeout=self.timeout, verify=False)
+            resp = self._get_with_retry(url, merged, headers, verify=False)
             resp.raise_for_status()
             data = resp.json()
             if str(data.get("success")).lower() != "true":
@@ -245,11 +371,11 @@ class CWAClient:
             return data
 
         try:
-            resp = requests.get(url, params=merged, timeout=self.timeout)
+            resp = self._get_with_retry(url, merged, headers, verify=True)
         except requests.exceptions.SSLError as exc:
             logger.warning(f"CWA SSL 驗證失敗，改用未驗證連線重試：{exc}")
             urllib3.disable_warnings(InsecureRequestWarning)
-            resp = requests.get(url, params=merged, timeout=self.timeout, verify=False)
+            resp = self._get_with_retry(url, merged, headers, verify=False)
         resp.raise_for_status()
         data = resp.json()
 
@@ -258,6 +384,57 @@ class CWAClient:
             raise RuntimeError(f"CWA API 回傳 success != true：{data.get('msg') or data}")
 
         return data
+
+
+class OpenMeteoClient:
+    BASE = "https://api.open-meteo.com/v1/forecast"
+
+    def __init__(self, timeout: int = 15, max_retries: int = 3, retry_backoff_seconds: float = 1.0):
+        self.timeout = timeout
+        self.max_retries = max(1, max_retries)
+        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+
+    def get_forecast(self, latitude: float, longitude: float) -> Dict[str, Any]:
+        params = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "timezone": "Asia/Taipei",
+            "forecast_days": 7,
+            "daily": [
+                "weather_code",
+                "temperature_2m_max",
+                "temperature_2m_min",
+                "apparent_temperature_max",
+                "apparent_temperature_min",
+                "precipitation_probability_max",
+                "wind_speed_10m_max",
+            ],
+            "hourly": [
+                "weather_code",
+                "wind_speed_10m",
+            ],
+        }
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.get(self.BASE, params=params, timeout=self.timeout)
+                if resp.status_code in CWAClient.RETRY_STATUS_CODES:
+                    raise requests.exceptions.HTTPError(f"HTTP {resp.status_code}", response=resp)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt >= self.max_retries:
+                    raise
+                wait = self.retry_backoff_seconds * (2 ** (attempt - 1))
+                logger.warning("Open-Meteo 請求失敗（第 %d/%d 次），%.1f 秒後重試...", attempt, self.max_retries, wait)
+                if wait > 0:
+                    time.sleep(wait)
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Open-Meteo 請求失敗：未知錯誤")
 
 
 # ==========================================
@@ -313,6 +490,35 @@ def _parse_dt(s: str) -> datetime:
 def _to_mmdd_weekday(dt: date) -> str:
     weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
     return f"{dt.strftime('%m-%d')}({weekday_map[dt.weekday()]})"
+
+
+def _open_meteo_code_to_text(code: Optional[int]) -> str:
+    if code is None:
+        return "多雲"
+    if code == 0:
+        return "晴"
+    if code in {1, 2, 3}:
+        return "多雲"
+    if code in {45, 48}:
+        return "霧"
+    if code in {51, 53, 55, 56, 57}:
+        return "毛毛雨"
+    if code in {61, 63, 65, 66, 67, 80, 81, 82}:
+        return "雨"
+    if code in {71, 73, 75, 77, 85, 86}:
+        return "雪"
+    if code in {95, 96, 99}:
+        return "雷雨"
+    return "多雲"
+
+
+def _describe_open_meteo_day(code: Optional[int], pop: Optional[int], wind_kmh: Optional[float]) -> str:
+    parts = [_open_meteo_code_to_text(code)]
+    if pop is not None:
+        parts.append(f"降雨機率 {pop}%")
+    if wind_kmh is not None:
+        parts.append(f"最大風速 {wind_kmh:.0f} km/h")
+    return "，".join(parts)
 
 
 # ==========================================
@@ -859,6 +1065,78 @@ def build_today_snapshot_and_wind_warning(
     return out
 
 
+def build_open_meteo_weekly_daily_forecast(data: Dict[str, Any]) -> List[DailyForecast]:
+    daily = data.get("daily") or {}
+    times = daily.get("time") or []
+    weather_codes = daily.get("weather_code") or []
+    tmax = daily.get("temperature_2m_max") or []
+    tmin = daily.get("temperature_2m_min") or []
+    feel_max = daily.get("apparent_temperature_max") or []
+    feel_min = daily.get("apparent_temperature_min") or []
+    pop_max = daily.get("precipitation_probability_max") or []
+    wind_max = daily.get("wind_speed_10m_max") or []
+
+    out: List[DailyForecast] = []
+    for i, day_str in enumerate(times[:7]):
+        d0 = datetime.fromisoformat(day_str).date()
+        code = weather_codes[i] if i < len(weather_codes) else None
+        pop = pop_max[i] if i < len(pop_max) else None
+        wind = wind_max[i] if i < len(wind_max) else None
+        out.append(
+            DailyForecast(
+                d=d0,
+                condition=_open_meteo_code_to_text(int(code)) if code is not None else "多雲",
+                tmax=float(tmax[i]) if i < len(tmax) and tmax[i] is not None else None,
+                tmin=float(tmin[i]) if i < len(tmin) and tmin[i] is not None else None,
+                feel_day=float(feel_max[i]) if i < len(feel_max) and feel_max[i] is not None else None,
+                feel_night=float(feel_min[i]) if i < len(feel_min) and feel_min[i] is not None else None,
+                pop=int(round(float(pop))) if pop is not None else None,
+                humidity=None,
+                desc=_describe_open_meteo_day(
+                    int(code) if code is not None else None,
+                    int(round(float(pop))) if pop is not None else None,
+                    float(wind) if wind is not None else None,
+                ),
+            )
+        )
+    return out
+
+
+def build_open_meteo_snapshot(data: Dict[str, Any]) -> ShortTermSnapshot:
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    weather_codes = hourly.get("weather_code") or []
+    wind_speeds = hourly.get("wind_speed_10m") or []
+    now = datetime.now()
+    horizon = now + timedelta(hours=24)
+
+    best_desc = None
+    best_dt_diff = None
+    max_wind_kmh = None
+
+    for i, ts in enumerate(times):
+        try:
+            dt0 = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+
+        code = weather_codes[i] if i < len(weather_codes) else None
+        wind = wind_speeds[i] if i < len(wind_speeds) else None
+
+        diff = abs((dt0 - now).total_seconds())
+        if best_dt_diff is None or diff < best_dt_diff:
+            best_desc = _open_meteo_code_to_text(int(code)) if code is not None else "多雲"
+            best_dt_diff = diff
+
+        if now <= dt0 <= horizon and wind is not None:
+            wind_kmh = float(wind)
+            if max_wind_kmh is None or wind_kmh > max_wind_kmh:
+                max_wind_kmh = wind_kmh
+
+    wind_warning = WindWarningSystem.get_warning(max_wind_kmh) if max_wind_kmh is not None else None
+    return ShortTermSnapshot(today_desc=best_desc, wind_warning=wind_warning or None)
+
+
 # ==========================================
 # 報表輸出：圖表
 # ==========================================
@@ -1072,75 +1350,145 @@ def main() -> None:
         logger.warning("已啟用 CWA_SKIP_SSL_VERIFY，將直接跳過 CWA HTTPS 憑證驗證")
 
     client = CWAClient(api_key, skip_ssl_verify=skip_ssl_verify)
+    open_meteo_client = OpenMeteoClient()
+
+    def fetch_dataset_with_cache(dataset_id: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            data = client.get(dataset_id, params=params)
+            save_dataset_cache(dataset_id, data)
+            return data
+        except requests.exceptions.RequestException as exc:
+            logger.error("取得 %s 失敗：%s", dataset_id, exc)
+            cached = load_dataset_cache(dataset_id)
+            if cached is not None:
+                return cached
+            return None
+
+    def fetch_open_meteo_by_town() -> Tuple[Dict[str, List[DailyForecast]], Dict[str, ShortTermSnapshot]]:
+        weekly: Dict[str, List[DailyForecast]] = {}
+        snapshots: Dict[str, ShortTermSnapshot] = {}
+
+        for town in cfg.townships:
+            coord = cfg.open_meteo_coords.get(town) if cfg.open_meteo_coords else None
+            if not coord:
+                logger.warning("找不到 %s 的 Open-Meteo 座標設定，略過備援", town)
+                continue
+
+            latitude = coord.get("latitude")
+            longitude = coord.get("longitude")
+            if latitude is None or longitude is None:
+                logger.warning("%s 的 Open-Meteo 座標不完整，略過備援", town)
+                continue
+
+            try:
+                logger.info("正在取得 Open-Meteo 備援資料：%s", town)
+                om_data = open_meteo_client.get_forecast(float(latitude), float(longitude))
+            except requests.exceptions.RequestException as exc:
+                logger.error("取得 Open-Meteo 備援資料失敗（%s）：%s", town, exc)
+                continue
+
+            weekly[town] = build_open_meteo_weekly_daily_forecast(om_data)
+            snapshots[town] = build_open_meteo_snapshot(om_data)
+
+        return weekly, snapshots
 
     # 1) 拉資料：3 天（3 小時） + 1 週（12 小時）
+    data_069: Optional[Dict[str, Any]] = None
     logger.info("正在取得 F-D0047-069（3天/3小時）資料...")
-    data_069 = client.get(
-        cfg.dataset_3day,
-        params={
-            "LocationsName": cfg.city,
-            # LocationName 支援多個同名參數
-            **{f"LocationName": cfg.townships[0]}  # 先放一個，後面用 requests 的 list 形式更保險
-        },
-    )
-
-    # requests params 需要 list 才能帶多個同名 key；因此改用第二次呼叫（更乾淨）
-    # 這樣可確保多個鄉鎮都會回傳
-    data_069 = client.get(
+    # requests params 以 list 帶多個同名 key：
+    # LocationName=...&LocationName=...
+    data_069 = fetch_dataset_with_cache(
         cfg.dataset_3day,
         params={
             "LocationsName": cfg.city,
             "LocationName": cfg.townships,  # list -> LocationName=...&LocationName=...
         },
     )
+    if data_069 is None:
+        logger.error("取得 F-D0047-069 失敗，且無可用快取，將以降級模式繼續執行")
 
     logger.info("正在取得 F-D0047-071（1週/12小時）資料...")
-    data_071 = client.get(
+    data_071 = fetch_dataset_with_cache(
         cfg.dataset_1week,
         params={
             "LocationsName": cfg.city,
             "LocationName": cfg.townships,
         },
     )
+    open_meteo_weekly: Dict[str, List[DailyForecast]] = {}
+    open_meteo_snapshots: Dict[str, ShortTermSnapshot] = {}
+    if data_071 is None or data_069 is None:
+        open_meteo_weekly, open_meteo_snapshots = fetch_open_meteo_by_town()
 
-    # 1.5) 輸出原始資料 CSV（各資料集各兩份：long / wide）
-    raw_069_long = build_cwa_raw_csv_rows(
-        cfg.dataset_3day,
-        "未來3天預報（逐3小時）",
-        data_069,
-        cfg.city,
-        cfg.townships,
-    )
-    raw_071_long = build_cwa_raw_csv_rows(
-        cfg.dataset_1week,
-        "未來1週預報（逐12小時）",
-        data_071,
-        cfg.city,
-        cfg.townships,
-    )
-    export_cwa_raw_csv(OUTPUT_DIR / "weather_raw_069_long.csv", raw_069_long)
-    export_cwa_raw_csv(OUTPUT_DIR / "weather_raw_071_long.csv", raw_071_long)
+    if data_071 is None and not open_meteo_weekly:
+        logger.error("取得 F-D0047-071 失敗，且 Open-Meteo 備援也不可用，無法產生新報表")
+        logger.info("保留既有輸出檔案不變")
+        return
 
-    raw_069_wide_rows, raw_069_wide_fields = build_cwa_raw_wide_rows(
-        cfg.dataset_3day,
-        "未來3天預報（逐3小時）",
-        data_069,
-        cfg.city,
-        cfg.townships,
-    )
-    raw_071_wide_rows, raw_071_wide_fields = build_cwa_raw_wide_rows(
-        cfg.dataset_1week,
-        "未來1週預報（逐12小時）",
-        data_071,
-        cfg.city,
-        cfg.townships,
-    )
-    export_cwa_raw_wide_csv(OUTPUT_DIR / "weather_raw_069.csv", raw_069_wide_rows, raw_069_wide_fields)
-    export_cwa_raw_wide_csv(OUTPUT_DIR / "weather_raw_071.csv", raw_071_wide_rows, raw_071_wide_fields)
+    # 1.5) 輸出原始資料 CSV（僅 CWA 資料可輸出）
+    if data_071 is not None:
+        raw_071_long = build_cwa_raw_csv_rows(
+            cfg.dataset_1week,
+            "未來1週預報（逐12小時）",
+            data_071,
+            cfg.city,
+            cfg.townships,
+        )
+        export_cwa_raw_csv(OUTPUT_DIR / "weather_raw_071_long.csv", raw_071_long)
+    else:
+        logger.warning("略過 weather_raw_071_long.csv，因為 F-D0047-071 改用 Open-Meteo 備援")
+
+    if data_069 is not None:
+        raw_069_long = build_cwa_raw_csv_rows(
+            cfg.dataset_3day,
+            "未來3天預報（逐3小時）",
+            data_069,
+            cfg.city,
+            cfg.townships,
+        )
+        export_cwa_raw_csv(OUTPUT_DIR / "weather_raw_069_long.csv", raw_069_long)
+    else:
+        logger.warning("略過 weather_raw_069_long.csv，因為 F-D0047-069 無法取得")
+
+    if data_071 is not None:
+        raw_071_wide_rows, raw_071_wide_fields = build_cwa_raw_wide_rows(
+            cfg.dataset_1week,
+            "未來1週預報（逐12小時）",
+            data_071,
+            cfg.city,
+            cfg.townships,
+        )
+        export_cwa_raw_wide_csv(OUTPUT_DIR / "weather_raw_071.csv", raw_071_wide_rows, raw_071_wide_fields)
+    else:
+        logger.warning("略過 weather_raw_071.csv，因為 F-D0047-071 改用 Open-Meteo 備援")
+
+    if data_069 is not None:
+        raw_069_wide_rows, raw_069_wide_fields = build_cwa_raw_wide_rows(
+            cfg.dataset_3day,
+            "未來3天預報（逐3小時）",
+            data_069,
+            cfg.city,
+            cfg.townships,
+        )
+        export_cwa_raw_wide_csv(OUTPUT_DIR / "weather_raw_069.csv", raw_069_wide_rows, raw_069_wide_fields)
+    else:
+        logger.warning("略過 weather_raw_069.csv，因為 F-D0047-069 無法取得")
 
     # 2) 彙整：週報（每日） + 今日概況/風力提醒
-    weekly_by_town = build_weekly_daily_forecast(data_071, cfg.city, cfg.townships)
-    snapshot_by_town = build_today_snapshot_and_wind_warning(data_069, cfg.city, cfg.townships)
+    if data_071 is not None:
+        weekly_by_town = build_weekly_daily_forecast(data_071, cfg.city, cfg.townships)
+    else:
+        weekly_by_town = open_meteo_weekly
+
+    if data_069 is not None:
+        snapshot_by_town = build_today_snapshot_and_wind_warning(data_069, cfg.city, cfg.townships)
+    elif open_meteo_snapshots:
+        snapshot_by_town = open_meteo_snapshots
+    else:
+        snapshot_by_town = {
+            town: ShortTermSnapshot(today_desc=None, wind_warning=None)
+            for town in cfg.townships
+        }
 
     # 3) 產生輸出（每個鄉鎮一份文字報告；圖表以第一個鄉鎮為主）
     #    你若要把兩個鄉鎮都畫成圖，可擴充為多張圖或合併圖。
