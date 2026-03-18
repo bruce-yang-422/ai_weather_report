@@ -1,15 +1,15 @@
 {
   "location": {
     "city": "新北市",
-    "townships": ["五股區", "泰山區"],
+    "townships": ["蘆洲區", "泰山區"],
     "open_meteo_coords": {
-      "五股區": {
-        "latitude": 25.0827,
-        "longitude": 121.4381
+      "蘆洲區": {
+        "latitude": 25.076134881491722,
+        "longitude": 121.47669968399556
       },
       "泰山區": {
-        "latitude": 25.0589,
-        "longitude": 121.4316
+        "latitude": 25.04696465891518,
+        "longitude": 121.42661936526125
       }
     }
   },

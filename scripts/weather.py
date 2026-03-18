@@ -173,8 +173,8 @@ def load_dataset_cache(dataset_id: str) -> Optional[Dict[str, Any]]:
 
 
 DEFAULT_OPEN_METEO_COORDS: Dict[str, Dict[str, float]] = {
-    "五股區": {"latitude": 25.0827, "longitude": 121.4381},
-    "泰山區": {"latitude": 25.0589, "longitude": 121.4316},
+    "蘆洲區": {"latitude": 25.076134881491722, "longitude": 121.47669968399556},
+    "泰山區": {"latitude": 25.04696465891518, "longitude": 121.42661936526125},
 }
 
 
@@ -199,7 +199,7 @@ class Config:
 
     def __post_init__(self):
         if self.townships is None:
-            self.townships = ["五股區", "泰山區"]
+            self.townships = ["蘆洲區", "泰山區"]
         if self.open_meteo_coords is None:
             self.open_meteo_coords = dict(DEFAULT_OPEN_METEO_COORDS)
         if self.fallback_fonts is None:
@@ -216,7 +216,7 @@ class Config:
             loc = data.get("location", {}) if isinstance(data, dict) else {}
 
             city = loc.get("city", "新北市")
-            townships = loc.get("townships") or ["五股區", "泰山區"]
+            townships = loc.get("townships") or ["蘆洲區", "泰山區"]
             open_meteo_coords = loc.get("open_meteo_coords") or dict(DEFAULT_OPEN_METEO_COORDS)
 
             font = data.get("font", {}) if isinstance(data, dict) else {}
@@ -815,6 +815,37 @@ def export_cwa_raw_wide_csv(
     logger.info(f"原始資料寬表 CSV 已生成：{output_path}")
 
 
+OM_DAILY_FIELDNAMES = [
+    "鄉鎮市區", "日期", "天氣", "最高溫_°C", "最低溫_°C",
+    "體感_白天_°C", "體感_夜間_°C", "降雨機率_%", "描述",
+]
+
+
+def export_open_meteo_csv(
+    output_path: Path,
+    weekly_by_town: Dict[str, List["DailyForecast"]],
+) -> None:
+    rows: List[Dict[str, str]] = []
+    for town, forecasts in weekly_by_town.items():
+        for f in forecasts:
+            rows.append({
+                "鄉鎮市區": town,
+                "日期": f.d.isoformat(),
+                "天氣": f.condition or "",
+                "最高溫_°C": f"{f.tmax:.1f}" if f.tmax is not None else "",
+                "最低溫_°C": f"{f.tmin:.1f}" if f.tmin is not None else "",
+                "體感_白天_°C": f"{f.feel_day:.1f}" if f.feel_day is not None else "",
+                "體感_夜間_°C": f"{f.feel_night:.1f}" if f.feel_night is not None else "",
+                "降雨機率_%": str(f.pop) if f.pop is not None else "",
+                "描述": f.desc or "",
+            })
+    with output_path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=OM_DAILY_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info(f"Open-Meteo 資料 CSV 已生成：{output_path}")
+
+
 # ==========================================
 # 週報（F-D0047-071）彙整為「每日」
 # ==========================================
@@ -1138,6 +1169,71 @@ def build_open_meteo_snapshot(data: Dict[str, Any]) -> ShortTermSnapshot:
 
 
 # ==========================================
+# CWA + Open-Meteo 資料合併
+# ==========================================
+
+def _avg_optional(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is not None and b is not None:
+        return (a + b) / 2
+    return a if a is not None else b
+
+
+def merge_daily_forecast(cwa: DailyForecast, om: DailyForecast) -> DailyForecast:
+    """
+    合併單日 CWA 與 Open-Meteo 預報：
+    - 溫度 / 體感：取平均（兩個模型互補）
+    - 降雨機率：取最大值（偏保守，避免漏報）
+    - 天氣描述 / 文字：優先保留 CWA（有中文本地描述）
+    - 濕度：僅 CWA 提供，直接沿用
+    """
+    condition = cwa.condition if cwa.condition not in (None, "—") else om.condition
+    pop: Optional[int] = None
+    if cwa.pop is not None and om.pop is not None:
+        pop = max(cwa.pop, om.pop)
+    else:
+        pop = cwa.pop if cwa.pop is not None else om.pop
+
+    return DailyForecast(
+        d=cwa.d,
+        condition=condition,
+        tmax=_avg_optional(cwa.tmax, om.tmax),
+        tmin=_avg_optional(cwa.tmin, om.tmin),
+        feel_day=_avg_optional(cwa.feel_day, om.feel_day),
+        feel_night=_avg_optional(cwa.feel_night, om.feel_night),
+        pop=pop,
+        humidity=cwa.humidity,
+        desc=cwa.desc,
+    )
+
+
+def merge_daily_forecasts(
+    cwa_list: List[DailyForecast],
+    om_list: List[DailyForecast],
+) -> List[DailyForecast]:
+    """依日期對齊，逐日合併 CWA 與 Open-Meteo 預報列表。"""
+    if not cwa_list:
+        return om_list
+    if not om_list:
+        return cwa_list
+    om_by_date = {f.d: f for f in om_list}
+    return [
+        merge_daily_forecast(cwa, om_by_date[cwa.d]) if cwa.d in om_by_date else cwa
+        for cwa in cwa_list
+    ]
+
+
+def merge_snapshots(cwa_snap: ShortTermSnapshot, om_snap: ShortTermSnapshot) -> ShortTermSnapshot:
+    """
+    合併今日快照：
+    - 描述：優先 CWA（本地文字）
+    - 風力警示：取兩者都有時較嚴的那個
+    """
+    desc = cwa_snap.today_desc or om_snap.today_desc
+    warning = cwa_snap.wind_warning or om_snap.wind_warning
+    return ShortTermSnapshot(today_desc=desc, wind_warning=warning)
+
+
+# ==========================================
 # 報表輸出：圖表
 # ==========================================
 
@@ -1151,79 +1247,140 @@ def generate_image_report(
     conditions: List[str],
     rain_probs: List[Optional[int]],
     humidities: List[Optional[float]],
+    title: str = "未來 7 天天氣預報 (CWA)",
 ) -> None:
     if plt is None:
         logger.warning(f"matplotlib 不可用，跳過圖表報表生成：{MATPLOTLIB_IMPORT_ERROR}")
         return
 
-    fig, (ax_table, ax_chart) = plt.subplots(
-        nrows=2, ncols=1, figsize=(12, 10),
-        gridspec_kw={"height_ratios": [0.8, 1]},
-        facecolor="white",
+    n = len(days)
+    # 850px 寬：figsize=(8.5, 10.5) × dpi=100 → 850×1050px
+    fig = plt.figure(figsize=(8.5, 10.5), facecolor="#F5F7FA")
+    gs = fig.add_gridspec(
+        nrows=2, ncols=1,
+        height_ratios=[0.7, 1.5],
+        hspace=0.12,
+        left=0.08, right=0.94,
+        top=0.93, bottom=0.06,
     )
 
-    # 表格
+    # ── 主標題 ────────────────────────────────────────────────
+    fig.suptitle(title, fontsize=14, weight="bold", color="#1A1A2E", y=0.97)
+
+    # ── 上半：資料表格（bbox 撐滿面板）────────────────────────
+    ax_table = fig.add_subplot(gs[0])
+    ax_table.set_facecolor("#F5F7FA")
     ax_table.axis("off")
-    ax_table.set_title("未來 7 天天氣預報 (CWA)", fontsize=16, pad=20, weight="bold")
 
-    columns = ("日期", "天氣", "最高溫\n(°C)", "最低溫\n(°C)", "體感(°C)\n日/夜", "降雨\n(%)", "濕度\n(%)")
+    columns = ("日期", "天氣", "最高\n°C", "最低\n°C", "體感°C\n日/夜", "雨%", "濕%")
     cell_text = []
-
-    for i in range(len(days)):
-        d_feel = f"{day_feels[i]:.1f}" if day_feels[i] is not None else "-"
-        n_feel = f"{night_feels[i]:.1f}" if night_feels[i] is not None else "-"
-        feel_str = f"{d_feel} / {n_feel}"
-
+    for i in range(n):
+        d_feel = f"{day_feels[i]:.0f}" if day_feels[i] is not None else "-"
+        n_feel = f"{night_feels[i]:.0f}" if night_feels[i] is not None else "-"
         tmax_str = f"{tmax[i]:.0f}" if tmax[i] is not None else "-"
         tmin_str = f"{tmin[i]:.0f}" if tmin[i] is not None else "-"
         pop_str = f"{rain_probs[i]:.0f}" if rain_probs[i] is not None else "-"
         rh_str = f"{humidities[i]:.0f}" if humidities[i] is not None else "-"
+        cell_text.append([days[i], conditions[i], tmax_str, tmin_str,
+                          f"{d_feel}/{n_feel}", pop_str, rh_str])
 
-        cell_text.append([days[i], conditions[i], tmax_str, tmin_str, feel_str, pop_str, rh_str])
-
+    from matplotlib.transforms import Bbox as MplBbox
     table = ax_table.table(
         cellText=cell_text,
         colLabels=columns,
-        loc="center",
         cellLoc="center",
-        bbox=[0.05, 0.1, 0.9, 0.8],
+        bbox=MplBbox.from_bounds(0.0, 0.0, 1.0, 1.0),  # 填滿整個面板
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(11)
+    table.set_fontsize(10)
 
-    # 表格樣式
+    # header 給 1.8 倍高，剩餘平分給 7 筆資料列
+    _n_data = len(cell_text)
+    _header_h = 1.0 / (_n_data + 1) * 1.8
+    _data_h = (1.0 - _header_h) / _n_data
+
+    COL_WIDTHS = [0.16, 0.18, 0.10, 0.10, 0.17, 0.09, 0.09]
     for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor("#CCCCCC")
+        cell.set_linewidth(0.5)
+        cell.set_height(_header_h if row == 0 else _data_h)
+        if col < len(COL_WIDTHS):
+            cell.set_width(COL_WIDTHS[col])
         if row == 0:
-            cell.set_facecolor("#4A90E2")
-            cell.set_text_props(weight="bold", color="white")
+            cell.set_facecolor("#2C5F8A")
+            cell.set_text_props(weight="bold", color="white", fontsize=10)
+        elif row == 1:
+            cell.set_facecolor("#FFF8DC")
         elif row % 2 == 0:
-            cell.set_facecolor("#f9f9f9")
-        if col == 4 and row > 0:
-            cell.set_text_props(weight="bold", color="#d62728")
+            cell.set_facecolor("#EEF2F7")
+        else:
+            cell.set_facecolor("#FFFFFF")
+        if col == 5 and row > 0:
+            try:
+                val = int(cell_text[row - 1][5]) if cell_text[row - 1][5] != "-" else 0
+            except Exception:
+                val = 0
+            if val >= 70:
+                cell.set_text_props(weight="bold", color="#C0392B")
+            elif val >= 40:
+                cell.set_text_props(weight="bold", color="#E67E22")
+        if col == 2 and row > 0:
+            cell.set_text_props(color="#C0392B")
+        if col == 3 and row > 0:
+            cell.set_text_props(color="#2471A3")
 
-    # 折線圖
-    ax_chart.set_facecolor("white")
+    # ── 下半：雙 Y 軸圖（溫度折線 + 降雨機率長條）────────────
+    ax_temp = fig.add_subplot(gs[1])
+    ax_temp.set_facecolor("#FFFFFF")
 
-    # 只畫有值的（避免 None 造成斷線）
-    x = np.arange(len(days))
+    x = np.arange(n)
 
-    def _plot_series(y, label, marker, linestyle):
+    def _plot_line(ax, y, label, color, marker, linestyle, lw=2.0, alpha=0.85):
         yv = np.array([np.nan if v is None else float(v) for v in y], dtype=float)
-        ax_chart.plot(days, yv, marker=marker, label=label, linestyle=linestyle, linewidth=2.5, alpha=0.8)
+        ax.plot(x, yv, marker=marker, label=label, color=color,
+                linestyle=linestyle, linewidth=lw, alpha=alpha, zorder=3,
+                markersize=5)
 
-    _plot_series(tmax, "最高溫", "o", "-")
-    _plot_series(tmin, "最低溫", "o", "-")
-    _plot_series(day_feels, "白天體感", "^", "--")
-    _plot_series(night_feels, "夜間體感", "v", ":")
+    _plot_line(ax_temp, tmax, "最高溫", "#E74C3C", "o", "-")
+    _plot_line(ax_temp, tmin, "最低溫", "#2980B9", "o", "-")
+    _plot_line(ax_temp, day_feels, "白天體感", "#F39C12", "^", "--", lw=1.6)
+    _plot_line(ax_temp, night_feels, "夜間體感", "#1ABC9C", "v", ":", lw=1.6)
 
-    ax_chart.set_xlabel("日期", fontsize=12)
-    ax_chart.set_ylabel("溫度 (°C)", fontsize=12)
-    ax_chart.set_title("氣溫與體感走勢", fontsize=14, weight="bold")
-    ax_chart.grid(True, linestyle="--", alpha=0.3)
-    ax_chart.legend(loc="best", framealpha=0.9)
+    ax_temp.set_ylim(0, 40)
+    ax_temp.set_ylabel("溫度 (°C)", fontsize=11, color="#333333")
+    ax_temp.tick_params(axis="y", labelcolor="#333333", labelsize=10)
+    ax_temp.set_xticks(x)
+    ax_temp.set_xticklabels(days, fontsize=9)
+    ax_temp.grid(True, linestyle="--", alpha=0.25, zorder=0)
+    ax_temp.spines["top"].set_visible(False)
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, facecolor="white", bbox_inches="tight")
+
+    ax_rain = ax_temp.twinx()
+    pop_vals = [float(v) if v is not None else 0.0 for v in rain_probs]
+    bar_colors = ["#2980B9" if p < 40 else "#E67E22" if p < 70 else "#C0392B" for p in pop_vals]
+    ax_rain.bar(x, pop_vals, width=0.4, color=bar_colors, alpha=0.25, zorder=2)
+    ax_rain.set_ylim(0, 130)
+    ax_rain.set_ylabel("降雨機率 (%)", fontsize=11, color="#2980B9")
+    ax_rain.tick_params(axis="y", labelcolor="#2980B9", labelsize=10)
+    ax_rain.spines["top"].set_visible(False)
+
+    for i, p in enumerate(pop_vals):
+        if p > 0:
+            ax_rain.text(i, p + 2, f"{int(p)}%", ha="center", va="bottom",
+                         fontsize=9, color="#2C5F8A", alpha=0.85)
+
+    lines_temp, labels_temp = ax_temp.get_legend_handles_labels()
+    from matplotlib.patches import Patch
+    rain_patch = Patch(facecolor="#2980B9", alpha=0.4, label="降雨機率")
+    ax_temp.legend(
+        lines_temp + [rain_patch],
+        labels_temp + ["降雨機率"],
+        loc="upper right", fontsize=9, framealpha=0.9, ncol=3,
+    )
+
+    ax_temp.set_title("氣溫走勢與降雨機率", fontsize=12, weight="bold", color="#1A1A2E", pad=6)
+
+    plt.savefig(output_path, dpi=100, facecolor="#F5F7FA", bbox_inches="tight")
     plt.close()
     logger.info(f"圖表已生成：{output_path}")
 
@@ -1371,20 +1528,20 @@ def main() -> None:
         for town in cfg.townships:
             coord = cfg.open_meteo_coords.get(town) if cfg.open_meteo_coords else None
             if not coord:
-                logger.warning("找不到 %s 的 Open-Meteo 座標設定，略過備援", town)
+                logger.warning("找不到 %s 的 Open-Meteo 座標設定，略過", town)
                 continue
 
             latitude = coord.get("latitude")
             longitude = coord.get("longitude")
             if latitude is None or longitude is None:
-                logger.warning("%s 的 Open-Meteo 座標不完整，略過備援", town)
+                logger.warning("%s 的 Open-Meteo 座標不完整，略過", town)
                 continue
 
             try:
-                logger.info("正在取得 Open-Meteo 備援資料：%s", town)
+                logger.info("正在取得 Open-Meteo 資料：%s", town)
                 om_data = open_meteo_client.get_forecast(float(latitude), float(longitude))
             except requests.exceptions.RequestException as exc:
-                logger.error("取得 Open-Meteo 備援資料失敗（%s）：%s", town, exc)
+                logger.error("取得 Open-Meteo 資料失敗（%s）：%s", town, exc)
                 continue
 
             weekly[town] = build_open_meteo_weekly_daily_forecast(om_data)
@@ -1415,13 +1572,12 @@ def main() -> None:
             "LocationName": cfg.townships,
         },
     )
-    open_meteo_weekly: Dict[str, List[DailyForecast]] = {}
-    open_meteo_snapshots: Dict[str, ShortTermSnapshot] = {}
-    if data_071 is None or data_069 is None:
-        open_meteo_weekly, open_meteo_snapshots = fetch_open_meteo_by_town()
+    # 永遠同時拉取 Open-Meteo（與 CWA 合併使用，提升準確性）
+    logger.info("正在取得 Open-Meteo 資料（與 CWA 合併使用）...")
+    open_meteo_weekly, open_meteo_snapshots = fetch_open_meteo_by_town()
 
     if data_071 is None and not open_meteo_weekly:
-        logger.error("取得 F-D0047-071 失敗，且 Open-Meteo 備援也不可用，無法產生新報表")
+        logger.error("取得 F-D0047-071 失敗，且 Open-Meteo 也不可用，無法產生新報表")
         logger.info("保留既有輸出檔案不變")
         return
 
@@ -1436,7 +1592,7 @@ def main() -> None:
         )
         export_cwa_raw_csv(OUTPUT_DIR / "weather_raw_071_long.csv", raw_071_long)
     else:
-        logger.warning("略過 weather_raw_071_long.csv，因為 F-D0047-071 改用 Open-Meteo 備援")
+        logger.warning("略過 weather_raw_071_long.csv，因為 F-D0047-071 無法取得")
 
     if data_069 is not None:
         raw_069_long = build_cwa_raw_csv_rows(
@@ -1460,7 +1616,7 @@ def main() -> None:
         )
         export_cwa_raw_wide_csv(OUTPUT_DIR / "weather_raw_071.csv", raw_071_wide_rows, raw_071_wide_fields)
     else:
-        logger.warning("略過 weather_raw_071.csv，因為 F-D0047-071 改用 Open-Meteo 備援")
+        logger.warning("略過 weather_raw_071.csv，因為 F-D0047-071 無法取得")
 
     if data_069 is not None:
         raw_069_wide_rows, raw_069_wide_fields = build_cwa_raw_wide_rows(
@@ -1474,14 +1630,36 @@ def main() -> None:
     else:
         logger.warning("略過 weather_raw_069.csv，因為 F-D0047-069 無法取得")
 
+    if open_meteo_weekly:
+        export_open_meteo_csv(OUTPUT_DIR / "weather_raw_open_meteo.csv", open_meteo_weekly)
+    else:
+        logger.warning("略過 weather_raw_open_meteo.csv，因為 Open-Meteo 資料不可用")
+
     # 2) 彙整：週報（每日） + 今日概況/風力提醒
+    #    CWA 與 Open-Meteo 同時可用時：合併；僅單一來源時：直接使用
     if data_071 is not None:
-        weekly_by_town = build_weekly_daily_forecast(data_071, cfg.city, cfg.townships)
+        cwa_weekly = build_weekly_daily_forecast(data_071, cfg.city, cfg.townships)
+        if open_meteo_weekly:
+            weekly_by_town = {
+                town: merge_daily_forecasts(cwa_weekly.get(town, []), open_meteo_weekly.get(town, []))
+                for town in cfg.townships
+            }
+            logger.info("已合併 CWA + Open-Meteo 週預報資料")
+        else:
+            weekly_by_town = cwa_weekly
     else:
         weekly_by_town = open_meteo_weekly
 
     if data_069 is not None:
-        snapshot_by_town = build_today_snapshot_and_wind_warning(data_069, cfg.city, cfg.townships)
+        cwa_snapshots = build_today_snapshot_and_wind_warning(data_069, cfg.city, cfg.townships)
+        if open_meteo_snapshots:
+            snapshot_by_town = {
+                town: merge_snapshots(cwa_snapshots.get(town, ShortTermSnapshot(None, None)),
+                                      open_meteo_snapshots.get(town, ShortTermSnapshot(None, None)))
+                for town in cfg.townships
+            }
+        else:
+            snapshot_by_town = cwa_snapshots
     elif open_meteo_snapshots:
         snapshot_by_town = open_meteo_snapshots
     else:
@@ -1489,6 +1667,16 @@ def main() -> None:
             town: ShortTermSnapshot(today_desc=None, wind_warning=None)
             for town in cfg.townships
         }
+
+    # 決定圖表標題（反映實際使用的資料來源）
+    using_cwa = data_071 is not None
+    using_om = bool(open_meteo_weekly)
+    if using_cwa and using_om:
+        chart_title = "未來 7 天天氣預報 (CWA + Open-Meteo)"
+    elif using_om:
+        chart_title = "未來 7 天天氣預報 (Open-Meteo)"
+    else:
+        chart_title = "未來 7 天天氣預報 (CWA)"
 
     # 3) 產生輸出（每個鄉鎮一份文字報告；圖表以第一個鄉鎮為主）
     #    你若要把兩個鄉鎮都畫成圖，可擴充為多張圖或合併圖。
@@ -1511,7 +1699,7 @@ def main() -> None:
 
     # 圖表
     img_path = OUTPUT_DIR / "weather_report.png"
-    generate_image_report(img_path, days, tmax, tmin, day_feels, night_feels, conditions, rain_probs, humidities)
+    generate_image_report(img_path, days, tmax, tmin, day_feels, night_feels, conditions, rain_probs, humidities, title=chart_title)
 
     # 文字（每個鄉鎮一份；同名覆蓋可以自行改檔名）
     for town in cfg.townships:

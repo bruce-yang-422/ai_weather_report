@@ -1,21 +1,21 @@
-# CWA 天氣報告（機車通勤族專用）
+# 天氣報告（機車通勤族專用）
 
 [![GitHub license](https://img.shields.io/github/license/bruce-yang-422/ai_weather_report)](LICENSE)
 [![GitHub last commit](https://img.shields.io/github/last-commit/bruce-yang-422/ai_weather_report)](https://github.com/bruce-yang-422/ai_weather_report/commits/main)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 
-自動從**中央氣象署（CWA）開放資料平台**抓取天氣預報，產出圖表與文字報告，針對機車通勤族設計。當 CWA API 維護或暫時失敗時，可自動切換至 **Open-Meteo** 備援來源。
+同時整合**中央氣象署（CWA）**與**Open-Meteo**兩個資料來源，交叉比對合併後產出圖表與文字報告，針對機車通勤族設計。
 
 ---
 
 ## 功能特色
 
-- **多區域同時查詢**：可設定多個行政區（如五股區、泰山區），各自產出獨立報告
-- **真實體感溫度**：考慮溫度、濕度、風速，計算日間 / 夜間體感溫度
-- **圖像化天氣報表**：未來 7 日最高 / 最低溫、體感溫度趨勢圖（`weather_report.png`）
+- **雙資料源合併**：CWA + Open-Meteo 同時取得，溫度取平均、降雨機率取最大值，提升預報準確性
+- **多區域同時查詢**：可設定多個行政區（如蘆洲區、泰山區），各自產出獨立報告
+- **真實體感溫度**：日間 / 夜間體感溫度分開顯示
+- **圖像化天氣報表**：未來 7 日溫度折線 + 降雨機率長條雙軸圖（`weather_report.png`）
 - **文字報告**：逐區天氣日報，含今日概況、未來一週預覽、機車通勤貼心提醒
-- **API 金鑰保護**：憑證存於 `cwa_api.env`，已列入 `.gitignore` 不會上傳 GitHub
-- **備援資料源**：CWA 失敗時可改用 Open-Meteo 產生一週報表與今日提醒
+- **API 金鑰保護**：CWA 憑證存於 `cwa_api.env`，已列入 `.gitignore` 不會上傳 GitHub
 
 ---
 
@@ -24,18 +24,22 @@
 ```text
 ai_weather_report/
 ├── config/
-│   └── config.json          # 地點、字型設定
-├── output/                  # 執行後自動產出（不納入版控）
-│   ├── weather_report.png
-│   ├── weather_analysis_五股區.txt
+│   └── config.json                    # 地點、字型設定
+├── output/                            # 執行後自動產出（不納入版控）
+│   ├── weather_report.png             # 7 日圖表
+│   ├── weather_analysis_蘆洲區.txt
 │   ├── weather_analysis_泰山區.txt
-│   ├── weather_raw_069.csv
-│   ├── weather_raw_071.csv
+│   ├── weather_analysis.txt           # 主要區域的報告（向下相容）
+│   ├── weather_raw_069.csv            # CWA 3天逐3小時（寬表）
+│   ├── weather_raw_069_long.csv       # CWA 3天逐3小時（長表）
+│   ├── weather_raw_071.csv            # CWA 1週逐12小時（寬表）
+│   ├── weather_raw_071_long.csv       # CWA 1週逐12小時（長表）
+│   ├── weather_raw_open_meteo.csv     # Open-Meteo 7日每日資料
 │   └── weather.log
 ├── scripts/
-│   └── weather.py           # 主程式
-├── cwa_api.env              # CWA API 金鑰（本地，不納入版控）
-├── run_weather.ps1          # Windows 快速執行腳本
+│   └── weather.py                     # 主程式
+├── cwa_api.env                        # CWA API 金鑰（本地，不納入版控）
+├── run_weather.ps1                    # Windows 快速執行腳本
 └── requirements.txt
 ```
 
@@ -72,10 +76,10 @@ CWA_SKIP_SSL_VERIFY=true   # 若遇到 SSL 驗證失敗可啟用
 {
   "location": {
     "city": "新北市",
-    "townships": ["五股區", "泰山區"],
+    "townships": ["蘆洲區", "泰山區"],
     "open_meteo_coords": {
-      "五股區": { "latitude": 25.0827, "longitude": 121.4381 },
-      "泰山區": { "latitude": 25.0589, "longitude": 121.4316 }
+      "蘆洲區": { "latitude": 25.076134881491722, "longitude": 121.47669968399556 },
+      "泰山區": { "latitude": 25.04696465891518, "longitude": 121.42661936526125 }
     }
   },
   "font": {
@@ -85,8 +89,7 @@ CWA_SKIP_SSL_VERIFY=true   # 若遇到 SSL 驗證失敗可啟用
 }
 ```
 
-> `townships` 可新增或移除行政區，每個區會各自產出一份文字報告。
-> `open_meteo_coords` 用於 CWA API 失敗時的 Open-Meteo 備援，新增行政區時請一併設定對應經緯度。
+> `townships` 為 CWA 鄉鎮名稱，同時用於 Open-Meteo 座標對應，新增區域時兩處需一併設定。
 
 ---
 
@@ -106,45 +109,29 @@ Windows 也可直接執行：
 
 | 檔案 | 說明 |
 |------|------|
-| `weather_report.png` | 未來 7 日圖像化天氣報表 |
+| `weather_report.png` | 未來 7 日圖像化天氣報表（850px） |
 | `weather_analysis_<區名>.txt` | 各區文字日報 |
-| `weather_raw_069.csv` / `weather_raw_071.csv` | 原始資料（3天/1週） |
+| `weather_raw_069.csv` / `weather_raw_071.csv` | CWA 原始資料（寬表） |
+| `weather_raw_069_long.csv` / `weather_raw_071_long.csv` | CWA 原始資料（長表） |
+| `weather_raw_open_meteo.csv` | Open-Meteo 7 日每日資料 |
 | `weather.log` | 執行紀錄（每次覆蓋） |
 
 ---
 
-## 輸出範例
+## 資料來源與合併策略
 
-### 文字日報（`weather_analysis_五股區.txt`）
+| 資料項目 | 合併方式 |
+|----------|----------|
+| 最高 / 最低溫 | CWA + Open-Meteo 平均 |
+| 體感溫度（日 / 夜） | CWA + Open-Meteo 平均 |
+| 降雨機率 | 取兩者最大值（較保守） |
+| 天氣描述 | 優先使用 CWA（本地中文描述） |
+| 濕度 | 僅 CWA 提供 |
 
-```text
-03-05(四) 氣象日報 - 五股區
-
-🌤️ 今日概況
-氣溫：17~24°C
-體感：日 25°C / 夜 17°C
-降雨機率：90%
-短暫陣雨。偏東風 平均風速1-2級。相對濕度91%。
-
-📅 未來一週
-- 週五(03-06)：☁️ 氣溫 16-20°C / 體感 20-15°C / 降雨 30%
-- 週六(03-07)：☁️ 氣溫 15-17°C / 體感 16-15°C / 降雨 10%
-...
-
-💡 貼心提醒
-1) 降雨機率高時請穿雨衣並注意視線。
-2) 風速升高時，高架、橋面請降低速度。
-3) 體感溫度低時，請備妥手套與保暖層。
-```
-
----
-
-## 資料來源
-
-- **天氣資料**：[中央氣象署開放資料平台](https://opendata.cwa.gov.tw/)
+- **CWA**：[中央氣象署開放資料平台](https://opendata.cwa.gov.tw/)
   - `F-D0047-069`：3 天逐 3 小時鄉鎮預報
   - `F-D0047-071`：1 週逐 12 小時鄉鎮預報
-- **備援資料**：[Open-Meteo Forecast API](https://open-meteo.com/en/docs)
+- **Open-Meteo**：[Open-Meteo Forecast API](https://open-meteo.com/en/docs)（免費、無需金鑰）
 
 ---
 
