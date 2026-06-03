@@ -400,6 +400,7 @@ class OpenMeteoClient:
             "longitude": longitude,
             "timezone": "Asia/Taipei",
             "forecast_days": 7,
+            "models": "best_match",
             "daily": [
                 "weather_code",
                 "temperature_2m_max",
@@ -408,10 +409,15 @@ class OpenMeteoClient:
                 "apparent_temperature_min",
                 "precipitation_probability_max",
                 "wind_speed_10m_max",
+                "shortwave_radiation_sum",
+                "uv_index_max",
             ],
             "hourly": [
                 "weather_code",
                 "wind_speed_10m",
+                "dew_point_2m",
+                "cloud_cover",
+                "soil_temperature_0cm",
             ],
         }
 
@@ -817,7 +823,9 @@ def export_cwa_raw_wide_csv(
 
 OM_DAILY_FIELDNAMES = [
     "鄉鎮市區", "日期", "天氣", "最高溫_°C", "最低溫_°C",
-    "體感_白天_°C", "體感_夜間_°C", "降雨機率_%", "描述",
+    "體感_白天_°C", "體感_夜間_°C", "降雨機率_%", "最大風速_km/h",
+    "短波輻射_MJ/m2", "紫外線指數", "露點_°C", "雲量_%",
+    "地表溫度_°C", "陰影係數", "估算MRT_°C", "描述",
 ]
 
 
@@ -837,6 +845,14 @@ def export_open_meteo_csv(
                 "體感_白天_°C": f"{f.feel_day:.1f}" if f.feel_day is not None else "",
                 "體感_夜間_°C": f"{f.feel_night:.1f}" if f.feel_night is not None else "",
                 "降雨機率_%": str(f.pop) if f.pop is not None else "",
+                "最大風速_km/h": f"{f.wind_kmh:.1f}" if f.wind_kmh is not None else "",
+                "短波輻射_MJ/m2": f"{f.solar_radiation_mj:.1f}" if f.solar_radiation_mj is not None else "",
+                "紫外線指數": f"{f.uv_index:.0f}" if f.uv_index is not None else "",
+                "露點_°C": f"{f.dew_point:.1f}" if f.dew_point is not None else "",
+                "雲量_%": f"{f.cloud_cover:.0f}" if f.cloud_cover is not None else "",
+                "地表溫度_°C": f"{f.surface_temp:.1f}" if f.surface_temp is not None else "",
+                "陰影係數": f"{f.shade_factor:.2f}" if f.shade_factor is not None else "",
+                "估算MRT_°C": f"{f.mrt:.1f}" if f.mrt is not None else "",
                 "描述": f.desc or "",
             })
     with output_path.open("w", encoding="utf-8-sig", newline="") as fh:
@@ -860,6 +876,14 @@ class DailyForecast:
     feel_night: Optional[float] # 以最低體感代表夜間感受
     pop: Optional[int]          # 降雨機率（取當日最大）
     humidity: Optional[float]   # 相對濕度（若有，取平均）
+    wind_kmh: Optional[float]   # 最大風速（km/h）
+    solar_radiation_mj: Optional[float] # 短波輻射日總量（MJ/m2）
+    uv_index: Optional[float]   # 紫外線指數
+    dew_point: Optional[float]  # 露點（°C）
+    cloud_cover: Optional[float] # 平均雲量（%）
+    surface_temp: Optional[float] # 地表/土壤 0 cm 溫度（°C）
+    shade_factor: Optional[float] # 0=遮蔭，1=直曬
+    mrt: Optional[float]        # 估算平均輻射溫度（°C）
     desc: Optional[str]
 
 
@@ -892,7 +916,10 @@ def build_weekly_daily_forecast(
         # - 最高體感：MaxApparentTemperature
         # - 最低體感：MinApparentTemperature
         # - 降雨機率：ProbabilityOfPrecipitation
+        # - 平均露點：DewPoint
         # - 相對濕度：RelativeHumidity
+        # - 風速：WindSpeed
+        # - 紫外線指數：UVIndex
         # - 綜合描述：WeatherDescription
 
         def collect_series(element_name: str) -> List[Dict[str, Any]]:
@@ -905,7 +932,10 @@ def build_weekly_daily_forecast(
         atmax_series = collect_series("最高體感溫度") or collect_series("MaxApparentTemperature")
         atmin_series = collect_series("最低體感溫度") or collect_series("MinApparentTemperature")
         pop_series = collect_series("12小時降雨機率") or collect_series("ProbabilityOfPrecipitation")
+        dew_series = collect_series("平均露點溫度") or collect_series("DewPoint")
         rh_series = collect_series("平均相對濕度") or collect_series("RelativeHumidity")
+        wind_series = collect_series("風速") or collect_series("WindSpeed")
+        uv_series = collect_series("紫外線指數") or collect_series("UVIndex")
         desc_series = collect_series("天氣預報綜合描述") or collect_series("WeatherDescription")
 
         # 以 StartTime 作為分桶鍵（12 小時一筆）
@@ -918,7 +948,7 @@ def build_weekly_daily_forecast(
                     continue
                 dt = _parse_dt(st)
                 d0 = dt.date()
-                b = day_bucket.setdefault(d0, {"wx": [], "tmax": [], "tmin": [], "atmax": [], "atmin": [], "pop": [], "rh": [], "desc": []})
+                b = day_bucket.setdefault(d0, {"wx": [], "tmax": [], "tmin": [], "atmax": [], "atmin": [], "pop": [], "dew": [], "rh": [], "wind": [], "uv": [], "desc": []})
                 b[kind].append(it)
 
         bucket_by_date(wx_series, "wx")
@@ -927,7 +957,10 @@ def build_weekly_daily_forecast(
         bucket_by_date(atmax_series, "atmax")
         bucket_by_date(atmin_series, "atmin")
         bucket_by_date(pop_series, "pop")
+        bucket_by_date(dew_series, "dew")
         bucket_by_date(rh_series, "rh")
+        bucket_by_date(wind_series, "wind")
+        bucket_by_date(uv_series, "uv")
         bucket_by_date(desc_series, "desc")
 
         # 依日期排序
@@ -962,6 +995,7 @@ def build_weekly_daily_forecast(
             tmin_vals = extract_float(b["tmin"], "MinTemperature") or extract_float(b["tmin"], "Temperature")
             atmax_vals = extract_float(b["atmax"], "MaxApparentTemperature") or extract_float(b["atmax"], "ApparentTemperature")
             atmin_vals = extract_float(b["atmin"], "MinApparentTemperature") or extract_float(b["atmin"], "ApparentTemperature")
+            dew_vals = extract_float(b["dew"], "DewPoint")
 
             # 降雨機率：取最大
             pop_vals = []
@@ -987,22 +1021,60 @@ def build_weekly_daily_forecast(
                 except Exception:
                     continue
 
+            # 風速：取最大，CWA 鄉鎮預報風速為 m/s，轉成 km/h
+            wind_vals = []
+            for it in b["wind"]:
+                ev = (it.get("ElementValue") or [{}])[0]
+                v = ev.get("WindSpeed")
+                if v is None:
+                    continue
+                try:
+                    wind_vals.append(float(v) * 3.6)
+                except Exception:
+                    continue
+
+            # 紫外線：取最大
+            uv_vals = []
+            for it in b["uv"]:
+                ev = (it.get("ElementValue") or [{}])[0]
+                v = ev.get("UVIndex")
+                if v is None:
+                    continue
+                try:
+                    uv_vals.append(float(v))
+                except Exception:
+                    continue
+
             # 描述：選當日第一筆
             desc = None
             if b["desc"]:
                 ev = (b["desc"][0].get("ElementValue") or [{}])[0]
                 desc = ev.get("WeatherDescription") or ev.get("value")
 
+            cwa_tmax = max(tmax_vals) if tmax_vals else None
+            cwa_pop = max(pop_vals) if pop_vals else None
+            cwa_uv = max(uv_vals) if uv_vals else None
+            cwa_shade_factor = _estimate_shade_factor(None, cwa_pop)
+            cwa_mrt = _estimate_mrt(cwa_tmax, None, cwa_uv, cwa_pop, None, cwa_shade_factor, None)
+
             out.append(
                 DailyForecast(
                     d=d0,
                     condition=condition,
-                    tmax=max(tmax_vals) if tmax_vals else None,
+                    tmax=cwa_tmax,
                     tmin=min(tmin_vals) if tmin_vals else None,
                     feel_day=max(atmax_vals) if atmax_vals else None,
                     feel_night=min(atmin_vals) if atmin_vals else None,
-                    pop=max(pop_vals) if pop_vals else None,
+                    pop=cwa_pop,
                     humidity=float(np.mean(rh_vals)) if rh_vals else None,
+                    wind_kmh=max(wind_vals) if wind_vals else None,
+                    solar_radiation_mj=None,
+                    uv_index=cwa_uv,
+                    dew_point=float(np.mean(dew_vals)) if dew_vals else None,
+                    cloud_cover=None,
+                    surface_temp=None,
+                    shade_factor=cwa_shade_factor,
+                    mrt=cwa_mrt,
                     desc=desc,
                 )
             )
@@ -1098,6 +1170,7 @@ def build_today_snapshot_and_wind_warning(
 
 def build_open_meteo_weekly_daily_forecast(data: Dict[str, Any]) -> List[DailyForecast]:
     daily = data.get("daily") or {}
+    hourly = data.get("hourly") or {}
     times = daily.get("time") or []
     weather_codes = daily.get("weather_code") or []
     tmax = daily.get("temperature_2m_max") or []
@@ -1106,6 +1179,9 @@ def build_open_meteo_weekly_daily_forecast(data: Dict[str, Any]) -> List[DailyFo
     feel_min = daily.get("apparent_temperature_min") or []
     pop_max = daily.get("precipitation_probability_max") or []
     wind_max = daily.get("wind_speed_10m_max") or []
+    solar_radiation = daily.get("shortwave_radiation_sum") or []
+    uv_max = daily.get("uv_index_max") or []
+    hourly_by_date = _aggregate_open_meteo_hourly_by_date(hourly)
 
     out: List[DailyForecast] = []
     for i, day_str in enumerate(times[:7]):
@@ -1113,16 +1189,35 @@ def build_open_meteo_weekly_daily_forecast(data: Dict[str, Any]) -> List[DailyFo
         code = weather_codes[i] if i < len(weather_codes) else None
         pop = pop_max[i] if i < len(pop_max) else None
         wind = wind_max[i] if i < len(wind_max) else None
+        solar = solar_radiation[i] if i < len(solar_radiation) else None
+        uv = uv_max[i] if i < len(uv_max) else None
+        hourly_stats = hourly_by_date.get(d0, {})
+        om_tmax = float(tmax[i]) if i < len(tmax) and tmax[i] is not None else None
+        om_pop = int(round(float(pop))) if pop is not None else None
+        om_solar = float(solar) if solar is not None else None
+        om_uv = float(uv) if uv is not None else None
+        om_cloud = hourly_stats.get("cloud_cover")
+        om_surface = hourly_stats.get("surface_temp")
+        om_shade_factor = _estimate_shade_factor(om_cloud, om_pop)
+        om_mrt = _estimate_mrt(om_tmax, om_solar, om_uv, om_pop, om_cloud, om_shade_factor, om_surface)
         out.append(
             DailyForecast(
                 d=d0,
                 condition=_open_meteo_code_to_text(int(code)) if code is not None else "多雲",
-                tmax=float(tmax[i]) if i < len(tmax) and tmax[i] is not None else None,
+                tmax=om_tmax,
                 tmin=float(tmin[i]) if i < len(tmin) and tmin[i] is not None else None,
                 feel_day=float(feel_max[i]) if i < len(feel_max) and feel_max[i] is not None else None,
                 feel_night=float(feel_min[i]) if i < len(feel_min) and feel_min[i] is not None else None,
-                pop=int(round(float(pop))) if pop is not None else None,
+                pop=om_pop,
                 humidity=None,
+                wind_kmh=float(wind) if wind is not None else None,
+                solar_radiation_mj=om_solar,
+                uv_index=om_uv,
+                dew_point=hourly_stats.get("dew_point"),
+                cloud_cover=om_cloud,
+                surface_temp=om_surface,
+                shade_factor=om_shade_factor,
+                mrt=om_mrt,
                 desc=_describe_open_meteo_day(
                     int(code) if code is not None else None,
                     int(round(float(pop))) if pop is not None else None,
@@ -1130,6 +1225,38 @@ def build_open_meteo_weekly_daily_forecast(data: Dict[str, Any]) -> List[DailyFo
                 ),
             )
         )
+    return out
+
+
+def _aggregate_open_meteo_hourly_by_date(hourly: Dict[str, Any]) -> Dict[date, Dict[str, Optional[float]]]:
+    times = hourly.get("time") or []
+    dew_points = hourly.get("dew_point_2m") or []
+    cloud_covers = hourly.get("cloud_cover") or []
+    surface_temps = hourly.get("soil_temperature_0cm") or []
+
+    buckets: Dict[date, Dict[str, List[float]]] = {}
+    for i, ts in enumerate(times):
+        try:
+            dt0 = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+
+        b = buckets.setdefault(dt0.date(), {"dew": [], "cloud": [], "surface": []})
+
+        if i < len(dew_points) and dew_points[i] is not None:
+            b["dew"].append(float(dew_points[i]))
+        if i < len(cloud_covers) and cloud_covers[i] is not None:
+            b["cloud"].append(float(cloud_covers[i]))
+        if 8 <= dt0.hour <= 17 and i < len(surface_temps) and surface_temps[i] is not None:
+            b["surface"].append(float(surface_temps[i]))
+
+    out: Dict[date, Dict[str, Optional[float]]] = {}
+    for d0, b in buckets.items():
+        out[d0] = {
+            "dew_point": float(np.mean(b["dew"])) if b["dew"] else None,
+            "cloud_cover": float(np.mean(b["cloud"])) if b["cloud"] else None,
+            "surface_temp": max(b["surface"]) if b["surface"] else None,
+        }
     return out
 
 
@@ -1172,36 +1299,315 @@ def build_open_meteo_snapshot(data: Dict[str, Any]) -> ShortTermSnapshot:
 # CWA + Open-Meteo 資料合併
 # ==========================================
 
-def _avg_optional(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    if a is not None and b is not None:
-        return (a + b) / 2
-    return a if a is not None else b
+def _forecast_lead_days(d0: date) -> int:
+    return max(0, (d0 - date.today()).days)
+
+
+def _cwa_weight_for_day(d0: date) -> float:
+    lead_days = _forecast_lead_days(d0)
+    if lead_days <= 2:
+        return 0.68
+    if lead_days <= 4:
+        return 0.60
+    return 0.55
+
+
+def _weighted_optional(
+    cwa_value: Optional[float],
+    om_value: Optional[float],
+    cwa_weight: float,
+) -> Optional[float]:
+    if cwa_value is not None and om_value is not None:
+        return (float(cwa_value) * cwa_weight) + (float(om_value) * (1.0 - cwa_weight))
+    return cwa_value if cwa_value is not None else om_value
+
+
+def _weighted_pop(cwa_pop: Optional[int], om_pop: Optional[int], cwa_weight: float) -> Optional[int]:
+    if cwa_pop is None:
+        return om_pop
+    if om_pop is None:
+        return cwa_pop
+
+    cwa_val = float(cwa_pop)
+    om_val = float(om_pop)
+    weighted = (cwa_val * cwa_weight) + (om_val * (1.0 - cwa_weight))
+    high = max(cwa_val, om_val)
+    low = min(cwa_val, om_val)
+
+    if high >= 70 and high - low >= 30:
+        weighted = max(weighted, high - 10)
+    elif high >= 40 and low >= 40:
+        weighted = max(weighted, high)
+
+    return int(round(min(100.0, max(0.0, weighted))))
+
+
+def _water_vapor_pressure_hpa(temp_c: float, humidity: float) -> float:
+    saturation_hpa = 6.105 * math.exp((17.27 * temp_c) / (237.7 + temp_c))
+    return saturation_hpa * min(100.0, max(0.0, humidity)) / 100.0
+
+
+def _steadman_apparent_temperature(temp_c: float, humidity: float, wind_kmh: Optional[float]) -> float:
+    wind_ms = max(0.1, float(wind_kmh) / 3.6) if wind_kmh is not None else 1.0
+    vapor_pressure = _water_vapor_pressure_hpa(temp_c, humidity)
+    return temp_c + (0.33 * vapor_pressure) - (0.70 * wind_ms) - 4.0
+
+
+def _wind_chill_celsius(temp_c: float, wind_kmh: float) -> float:
+    return (
+        13.12
+        + 0.6215 * temp_c
+        - 11.37 * (wind_kmh ** 0.16)
+        + 0.3965 * temp_c * (wind_kmh ** 0.16)
+    )
+
+
+def _relative_humidity_from_dew_point(temp_c: float, dew_point_c: float) -> float:
+    temp_vapor = math.exp((17.625 * temp_c) / (243.04 + temp_c))
+    dew_vapor = math.exp((17.625 * dew_point_c) / (243.04 + dew_point_c))
+    return min(100.0, max(0.0, 100.0 * dew_vapor / temp_vapor))
+
+
+def _estimate_shade_factor(cloud_cover: Optional[float], rain_probability: Optional[int]) -> float:
+    shade_factor = 1.0
+    if cloud_cover is not None:
+        shade_factor -= min(0.65, max(0.0, float(cloud_cover)) / 140.0)
+    if rain_probability is not None:
+        shade_factor -= min(0.25, max(0.0, float(rain_probability) - 30.0) / 220.0)
+    return min(1.0, max(0.15, shade_factor))
+
+
+def _estimate_mrt(
+    temp_c: Optional[float],
+    solar_radiation_mj: Optional[float],
+    uv_index: Optional[float],
+    rain_probability: Optional[int],
+    cloud_cover: Optional[float],
+    shade_factor: Optional[float],
+    surface_temp: Optional[float],
+) -> Optional[float]:
+    if temp_c is None:
+        return None
+
+    radiant = _solar_exposure_adjustment(
+        solar_radiation_mj,
+        uv_index,
+        rain_probability,
+        cloud_cover,
+        shade_factor,
+    )
+    surface_radiant = 0.0
+    if surface_temp is not None:
+        surface_radiant = max(0.0, float(surface_temp) - float(temp_c)) * 0.10
+    return float(temp_c) + radiant + surface_radiant
+
+
+def _physics_apparent_temperature(
+    temp_c: Optional[float],
+    humidity: Optional[float],
+    wind_kmh: Optional[float],
+    dew_point: Optional[float] = None,
+    solar_radiation_mj: Optional[float] = None,
+    uv_index: Optional[float] = None,
+    rain_probability: Optional[int] = None,
+    cloud_cover: Optional[float] = None,
+    surface_temp: Optional[float] = None,
+    shade_factor: Optional[float] = None,
+    mrt: Optional[float] = None,
+    include_solar: bool = False,
+) -> Optional[float]:
+    if temp_c is None:
+        return None
+
+    temp = float(temp_c)
+    humidity_val = float(humidity) if humidity is not None else None
+    if humidity_val is None and dew_point is not None:
+        humidity_val = _relative_humidity_from_dew_point(temp, float(dew_point))
+    wind = float(wind_kmh) if wind_kmh is not None else None
+    radiant_adjustment = 0.0
+    if include_solar:
+        if mrt is not None:
+            radiant_adjustment = max(0.0, float(mrt) - temp) * 0.18
+        else:
+            radiant_adjustment = _solar_exposure_adjustment(
+                solar_radiation_mj,
+                uv_index,
+                rain_probability,
+                cloud_cover,
+                shade_factor,
+            )
+            if surface_temp is not None:
+                radiant_adjustment += max(0.0, float(surface_temp) - temp) * 0.03
+        radiant_adjustment = min(2.0, radiant_adjustment)
+
+    if humidity_val is not None and temp >= 24.0:
+        apparent = _steadman_apparent_temperature(temp, humidity_val, wind)
+        if include_solar:
+            apparent += radiant_adjustment
+        return apparent
+
+    if wind is not None and temp <= 10.0 and wind >= 4.8:
+        apparent = _wind_chill_celsius(temp, wind)
+        if include_solar:
+            apparent += radiant_adjustment * 0.4
+        return apparent
+
+    apparent = temp
+    if wind is not None and temp < 24.0:
+        apparent -= min(2.0, max(0.0, wind - 10.0) * 0.05)
+    if include_solar:
+        apparent += radiant_adjustment
+    return apparent
+
+
+def _solar_exposure_adjustment(
+    solar_radiation_mj: Optional[float],
+    uv_index: Optional[float],
+    rain_probability: Optional[int],
+    cloud_cover: Optional[float] = None,
+    shade_factor: Optional[float] = None,
+) -> float:
+    solar_score = 0.0
+    if solar_radiation_mj is not None:
+        solar_score = max(solar_score, min(1.0, max(0.0, (float(solar_radiation_mj) - 8.0) / 14.0)))
+    if uv_index is not None:
+        solar_score = max(solar_score, min(1.0, max(0.0, float(uv_index) / 11.0)))
+
+    if rain_probability is not None:
+        cloud_factor = 1.0 - min(0.55, max(0.0, (float(rain_probability) - 30.0) / 100.0))
+        solar_score *= cloud_factor
+    if cloud_cover is not None:
+        solar_score *= 1.0 - min(0.65, max(0.0, float(cloud_cover)) / 140.0)
+    if shade_factor is not None:
+        solar_score *= min(1.0, max(0.0, float(shade_factor)))
+
+    return min(2.0, solar_score * 2.0)
+
+
+def _weighted_feel_temperature(
+    cwa_feel: Optional[float],
+    om_feel: Optional[float],
+    temp_c: Optional[float],
+    humidity: Optional[float],
+    wind_kmh: Optional[float],
+    dew_point: Optional[float],
+    solar_radiation_mj: Optional[float],
+    uv_index: Optional[float],
+    rain_probability: Optional[int],
+    cloud_cover: Optional[float],
+    surface_temp: Optional[float],
+    shade_factor: Optional[float],
+    mrt: Optional[float],
+    cwa_weight: float,
+    include_solar: bool = False,
+) -> Optional[float]:
+    source_feel = _weighted_optional(cwa_feel, om_feel, cwa_weight)
+    physics_feel = _physics_apparent_temperature(
+        temp_c,
+        humidity,
+        wind_kmh,
+        dew_point=dew_point,
+        solar_radiation_mj=solar_radiation_mj,
+        uv_index=uv_index,
+        rain_probability=rain_probability,
+        cloud_cover=cloud_cover,
+        surface_temp=surface_temp,
+        shade_factor=shade_factor,
+        mrt=mrt,
+        include_solar=include_solar,
+    )
+
+    if source_feel is None:
+        return physics_feel
+    if physics_feel is None:
+        return source_feel
+
+    physics_weight = 0.68
+    if humidity is not None or dew_point is not None:
+        physics_weight += 0.06
+    if wind_kmh is not None:
+        physics_weight += 0.04
+    if include_solar and (solar_radiation_mj is not None or uv_index is not None):
+        physics_weight += 0.05
+    if include_solar and (cloud_cover is not None or surface_temp is not None or mrt is not None):
+        physics_weight += 0.04
+    physics_weight = min(0.87, physics_weight)
+
+    return (float(source_feel) * (1.0 - physics_weight)) + (float(physics_feel) * physics_weight)
 
 
 def merge_daily_forecast(cwa: DailyForecast, om: DailyForecast) -> DailyForecast:
     """
     合併單日 CWA 與 Open-Meteo 預報：
-    - 溫度 / 體感：取平均（兩個模型互補）
-    - 降雨機率：取最大值（偏保守，避免漏報）
+    - 溫度 / 體感：依預報天數加權（近程較信 CWA，遠程稍提高 Open-Meteo）
+    - 降雨機率：加權後做保守修正，避免漏報明顯降雨風險
     - 天氣描述 / 文字：優先保留 CWA（有中文本地描述）
     - 濕度：僅 CWA 提供，直接沿用
     """
     condition = cwa.condition if cwa.condition not in (None, "—") else om.condition
-    pop: Optional[int] = None
-    if cwa.pop is not None and om.pop is not None:
-        pop = max(cwa.pop, om.pop)
-    else:
-        pop = cwa.pop if cwa.pop is not None else om.pop
+    cwa_weight = _cwa_weight_for_day(cwa.d)
+    pop = _weighted_pop(cwa.pop, om.pop, cwa_weight)
+    tmax = _weighted_optional(cwa.tmax, om.tmax, cwa_weight)
+    tmin = _weighted_optional(cwa.tmin, om.tmin, cwa_weight)
+    humidity = cwa.humidity
+    wind_kmh = _weighted_optional(cwa.wind_kmh, om.wind_kmh, cwa_weight)
+    solar_radiation_mj = _weighted_optional(cwa.solar_radiation_mj, om.solar_radiation_mj, cwa_weight)
+    uv_index = cwa.uv_index if cwa.uv_index is not None else om.uv_index
+    dew_point = _weighted_optional(cwa.dew_point, om.dew_point, cwa_weight)
+    cloud_cover = _weighted_optional(cwa.cloud_cover, om.cloud_cover, cwa_weight)
+    surface_temp = _weighted_optional(cwa.surface_temp, om.surface_temp, cwa_weight)
+    shade_factor = _estimate_shade_factor(cloud_cover, pop)
+    mrt = _estimate_mrt(tmax, solar_radiation_mj, uv_index, pop, cloud_cover, shade_factor, surface_temp)
 
     return DailyForecast(
         d=cwa.d,
         condition=condition,
-        tmax=_avg_optional(cwa.tmax, om.tmax),
-        tmin=_avg_optional(cwa.tmin, om.tmin),
-        feel_day=_avg_optional(cwa.feel_day, om.feel_day),
-        feel_night=_avg_optional(cwa.feel_night, om.feel_night),
+        tmax=tmax,
+        tmin=tmin,
+        feel_day=_weighted_feel_temperature(
+            cwa.feel_day,
+            om.feel_day,
+            tmax,
+            humidity,
+            wind_kmh,
+            dew_point,
+            solar_radiation_mj,
+            uv_index,
+            pop,
+            cloud_cover,
+            surface_temp,
+            shade_factor,
+            mrt,
+            cwa_weight,
+            include_solar=True,
+        ),
+        feel_night=_weighted_feel_temperature(
+            cwa.feel_night,
+            om.feel_night,
+            tmin,
+            humidity,
+            wind_kmh,
+            dew_point,
+            solar_radiation_mj,
+            uv_index,
+            pop,
+            cloud_cover,
+            surface_temp,
+            shade_factor,
+            mrt,
+            cwa_weight,
+            include_solar=False,
+        ),
         pop=pop,
-        humidity=cwa.humidity,
+        humidity=humidity,
+        wind_kmh=wind_kmh,
+        solar_radiation_mj=solar_radiation_mj,
+        uv_index=uv_index,
+        dew_point=dew_point,
+        cloud_cover=cloud_cover,
+        surface_temp=surface_temp,
+        shade_factor=shade_factor,
+        mrt=mrt,
         desc=cwa.desc,
     )
 
@@ -1236,6 +1642,16 @@ def merge_snapshots(cwa_snap: ShortTermSnapshot, om_snap: ShortTermSnapshot) -> 
 # ==========================================
 # 報表輸出：圖表
 # ==========================================
+
+def choose_temperature_axis_range(*series: List[Optional[float]]) -> Tuple[int, int, int]:
+    values = [float(v) for values in series for v in values if v is not None]
+    month = datetime.now().month
+    is_summer_scale = month in {5, 6, 7, 8, 9, 10} or any(v >= 35 for v in values)
+
+    if is_summer_scale:
+        return 15, 50, 5
+    return 0, 35, 5
+
 
 def generate_image_report(
     output_path: Path,
@@ -1346,7 +1762,14 @@ def generate_image_report(
     _plot_line(ax_temp, day_feels, "白天體感", "#F39C12", "^", "--", lw=1.6)
     _plot_line(ax_temp, night_feels, "夜間體感", "#1ABC9C", "v", ":", lw=1.6)
 
-    ax_temp.set_ylim(0, 40)
+    temp_axis_min, temp_axis_max, temp_axis_step = choose_temperature_axis_range(
+        tmax,
+        tmin,
+        day_feels,
+        night_feels,
+    )
+    ax_temp.set_ylim(temp_axis_min, temp_axis_max)
+    ax_temp.set_yticks(np.arange(temp_axis_min, temp_axis_max + 1, temp_axis_step))
     ax_temp.set_ylabel("溫度 (°C)", fontsize=11, color="#333333")
     ax_temp.tick_params(axis="y", labelcolor="#333333", labelsize=10)
     ax_temp.set_xticks(x)
