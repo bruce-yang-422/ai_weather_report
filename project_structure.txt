@@ -1,9 +1,27 @@
 📁 ai_weather_report
+├── 📂 .obsidian
+│   ├── 📋 app.json
+│   ├── 📋 appearance.json
+│   ├── 📋 core-plugins.json
+│   └── 📋 workspace.json
 ├── 📁 .venv
+├── 📂 C-B0026-002
+│   ├── 📊 ... 還有 105 個 .xml 檔案
+│   ├── 📊 file.csv
+│   ├── 📊 manifest.csv
+│   ├── 📋 mn_Report_201601.xml
+│   ├── 📋 mn_Report_201602.xml
+│   ├── 📋 mn_Report_201603.xml
+│   └── 📊 schema-file.csv
 ├── 📂 config
+│   ├── 📋 Weather_descriptions_API_keys.json
 │   └── 📋 config.json
 ├── 📂 output
-│   ├── 📊 ... 還有 1 個 .csv 檔案
+│   ├── 📂 cache
+│   │   ├── 📋 F-D0047-069.json
+│   │   └── 📋 F-D0047-071.json
+│   ├── 📊 ... 還有 1 個 .txt 檔案
+│   ├── 📊 ... 還有 2 個 .csv 檔案
 │   ├── 📋 weather.log
 │   ├── 📄 weather_analysis.txt
 │   ├── 📄 weather_analysis_五股區.txt
@@ -11,13 +29,20 @@
 │   ├── 📊 weather_raw_069.csv
 │   ├── 📊 weather_raw_069_long.csv
 │   ├── 📊 weather_raw_071.csv
-│   └── 🖼️ weather_report.png
+│   ├── 🖼️ weather_report.png
+│   └── 📋 weather_send_history.json
 ├── 📂 scripts
+│   ├── 🐍 copy_weather_report.py
+│   ├── 🐍 send_weather_report.py
+│   ├── 🐍 test_send_weather_report.py
 │   └── 🐍 weather.py
 ├── 📜 LICENSE
 ├── 📖 README.md
 ├── 🔧 cwa_api.env
+├── 🐍 main.py
+├── 🐍 plot_temperature.py
 ├── 📄 project_structure.txt
 ├── 🐍 project_tree_generator.py
 ├── 📋 requirements.txt
-└── 💻 run_weather.ps1
+├── 💻 run_weather.ps1
+└── 🖼️ temperature_trend.png
