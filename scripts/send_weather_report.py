@@ -15,6 +15,24 @@ ROOT = Path(__file__).resolve().parent.parent
 LINE_ROOT = Path(r"D:\Tools\LINE_Automation\line-oa-archive")
 TAIWAN = timezone(timedelta(hours=8))
 
+# 直接在這裡增刪收件人；recipient_id 必須是 Messaging API ID，
+# 不是 LINE App 裡用來搜尋好友的 LINE ID。
+# oa_basic_id 指定發送用的官方帳號，access token 仍從 .env 讀取。
+SUBSCRIBERS = [
+    {
+        "name": "楊翔志 Bruce",
+        "oa_basic_id": "@532gwhyz",
+        "recipient_id": "U366d133e3b2da4567abe4d5f86311436",
+        "active": True,  # 改成 False 可暫停發送給這位收件人。
+    },
+    {
+        "name": "家人",
+        "oa_basic_id": "@532gwhyz",
+        "recipient_id": "C64b86c669aa2ec2cc1874b487fd46ca9",
+        "active": False,  # 改成 True 可恢復發送給這位收件人。
+    },
+]
+
 
 def latest_image(directory, day):
     pattern = re.compile(rf"{day}_(\d{{6}})_v(\d+)\.png")
@@ -49,10 +67,14 @@ def run(args):
     day = datetime.now(TAIWAN).strftime("%Y%m%d")
     image = latest_image(args.media, day)
     url = args.base_url.rstrip("/") + "/weather/" + image.name
-    data = json.loads(args.subscribers.read_text(encoding="utf-8-sig"))
+    subscribers = (
+        json.loads(args.subscribers.read_text(encoding="utf-8-sig"))["subscribers"]
+        if args.subscribers is not None
+        else SUBSCRIBERS
+    )
     credentials = read_env(args.env)
     recipients = {}
-    for subscriber in data["subscribers"]:
+    for subscriber in subscribers:
         if subscriber.get("active") is False or subscriber.get("status") in ("inactive", "unsubscribed", "disabled"):
             continue
         oa = subscriber["oa_basic_id"].lstrip("@").upper()
@@ -129,7 +151,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--media", type=Path, default=LINE_ROOT / "media" / "weather")
-    parser.add_argument("--subscribers", type=Path, default=LINE_ROOT / "subscribers" / "weather.json")
+    parser.add_argument("--subscribers", type=Path, help="改用指定 JSON 名單；預設使用腳本內的 SUBSCRIBERS")
     parser.add_argument("--env", type=Path, default=LINE_ROOT / ".env")
     parser.add_argument("--base-url", default="https://reports.stack-base.com/media")
     parser.add_argument("--history", type=Path, default=ROOT / "output" / "weather_send_history.json")
